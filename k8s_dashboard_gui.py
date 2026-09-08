@@ -231,7 +231,7 @@ class Dashboard(tk.Tk):
         self.title("☸ K8s Resource Dashboard")
         self.geometry("1200x760")
         self.folder = folder
-        self.model = {}
+        self.model = {"nodes": [], "pods": [], "deployments": []}
         self._result_q: queue.Queue = queue.Queue()
         self._busy = False
         self._analysis_frames: list = []
@@ -291,6 +291,11 @@ class Dashboard(tk.Tk):
         else:
             self.status.config(text="⚠ kubectl not found on PATH — load JSON files, "
                                      "or install kubectl / set the KUBECTL env var." + cached)
+        # Show the (empty) data tabs up front so all tabs are visible before a refresh.
+        self._rebuild_analysis_tabs()
+        # Open on Nodes, not the (first-created) Trends tab.
+        if self._analysis_frames:
+            self.nb.select(self._analysis_frames[0])
 
     # -- live cluster ------------------------------------------------------
     def load_contexts(self):
@@ -379,7 +384,10 @@ class Dashboard(tk.Tk):
                  + (f"  ·  {source}" if source else "")
                  + ("" if has_metrics else "  ·  no metrics-server (usage blank)")
         )
-        # Rebuild only the data tabs; leave the persistent Trends tab intact.
+        self._rebuild_analysis_tabs()
+
+    def _rebuild_analysis_tabs(self):
+        """(Re)build the four data tabs; leave the persistent Trends tab intact."""
         for f in self._analysis_frames:
             self.nb.forget(f)
             f.destroy()
