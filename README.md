@@ -37,10 +37,20 @@ desktop app itself — it uses only the Python standard library.
 
 ## Usage
 
-Start the desktop app:
+Open a terminal in the project folder and start the desktop app. The only
+per-OS difference is the launcher name (`py`/`python` on Windows, `python3` on
+macOS/Linux):
+
+**Windows** (PowerShell or Command Prompt):
+
+```powershell
+py k8s_dashboard_gui.py
+```
+
+**macOS / Linux:**
 
 ```bash
-python k8s_dashboard_gui.py
+python3 k8s_dashboard_gui.py
 ```
 
 1. Pick a **context** from the dropdown (populated from your kubeconfig).
@@ -57,10 +67,17 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
 - **Pods** — filter by namespace/node
 - **Biggest offenders** — pods reserving far more memory than they actually use
 
-**Non-standard kubectl** — if your cluster needs a wrapper (e.g. k3s on a Pi):
+**Non-standard kubectl** — if your cluster needs a wrapper (e.g. k3s on a Pi),
+set the `KUBECTL` environment variable before launching:
+
+```powershell
+# Windows (PowerShell)
+$env:KUBECTL = "wsl sudo k3s kubectl"; py k8s_dashboard_gui.py
+```
 
 ```bash
-KUBECTL="sudo k3s kubectl" python k8s_dashboard_gui.py
+# macOS / Linux
+KUBECTL="sudo k3s kubectl" python3 k8s_dashboard_gui.py
 ```
 
 **Offline / web variant** — `app.py` is an optional Streamlit web version that
