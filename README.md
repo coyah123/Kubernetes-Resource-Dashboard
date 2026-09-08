@@ -66,6 +66,24 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
 - **Deployments** — per-pod and total (×replicas) reserved footprint
 - **Pods** — filter by namespace/node
 - **Biggest offenders** — pods reserving far more memory than they actually use
+- **Trends** — record resource use over time and graph it (see below)
+
+### Trends tab (capture over a day)
+
+Point-in-time snapshots miss daily peaks and troughs. The Trends tab samples
+deployment resource data on a fixed interval while the app is left running, so you
+build up a full day's picture instead of one moment.
+
+1. Pick an **interval** (5 / 15 / 30 min or 1 hour) and click **▶ Start capture**.
+   It takes a sample immediately, then again every interval. Leave the app open
+   (it can run all day on someone's machine).
+2. Choose a **namespace** — the graph draws **one line per deployment** in it.
+3. Choose the **metric** (Memory or CPU) and toggle the **usage** / **request**
+   lines. Solid = actual usage, dashed = requested (reserved).
+
+Samples are appended to `data/trends-history.jsonl` (gitignored), so history
+survives restarts and reloads when you reopen the app. Capture uses the same
+context selected at the top and needs metrics-server for the usage lines.
 
 **Reading the colors** — a **dark-red row** is a warning flag. What it means
 depends on the tab:

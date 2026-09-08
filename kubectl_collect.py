@@ -96,11 +96,13 @@ def collect(context: str = "", *, timeout: int = 60) -> dict:
     """
     Pull everything the dashboard needs, in memory, from the live cluster.
 
-    Returns a dict with keys: deployments, pods, nodes, pod_metrics, node_metrics
-    (each the parsed kubectl JSON). metrics-server data degrades to {} if the
-    metrics API isn't available, so the dashboard still works without it.
+    Returns a dict with keys: deployments, replicasets, pods, nodes, pod_metrics,
+    node_metrics (each the parsed kubectl JSON). metrics-server data degrades to {}
+    if the metrics API isn't available, so the dashboard still works without it.
+    ReplicaSets are used to attribute pod usage back to its owning Deployment.
     """
     deployments = _get_json(["get", "deploy", "-A", "-o", "json"], context=context, timeout=timeout)
+    replicasets = _get_json(["get", "rs", "-A", "-o", "json"], context=context, timeout=timeout)
     pods = _get_json(["get", "pods", "-A", "-o", "json"], context=context, timeout=timeout)
     nodes = _get_json(["get", "nodes", "-o", "json"], context=context, timeout=timeout)
 
@@ -118,6 +120,7 @@ def collect(context: str = "", *, timeout: int = 60) -> dict:
 
     return {
         "deployments": deployments,
+        "replicasets": replicasets,
         "pods": pods,
         "nodes": nodes,
         "pod_metrics": pod_metrics,

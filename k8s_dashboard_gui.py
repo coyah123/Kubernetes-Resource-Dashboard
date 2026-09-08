@@ -21,11 +21,17 @@ import json
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import kubectl_collect
+import trends
+
+# How often each interval choice fires, in milliseconds.
+_INTERVALS = {"5 min": 5 * 60_000, "15 min": 15 * 60_000,
+              "30 min": 30 * 60_000, "1 hour": 60 * 60_000}
 
 # ---------------------------------------------------------------------------
 # Quantity parsing (CPU -> millicores, memory -> bytes)
@@ -95,6 +101,7 @@ def build_model(folder: Path) -> dict:
     """Build the model from JSON files on disk (the offline / cached path)."""
     return build_model_from_raw({
         "deployments": _load(folder, "deployments.json"),
+        "replicasets": _load(folder, "replicasets.json"),
         "pods": _load(folder, "pods.json"),
         "nodes": _load(folder, "nodes.json"),
         "pod_metrics": _load(folder, "pod-metrics.json"),
@@ -105,10 +112,22 @@ def build_model(folder: Path) -> dict:
 def build_model_from_raw(raw: dict) -> dict:
     """Build the model from the five parsed kubectl JSON objects (live or cached)."""
     deployments = raw.get("deployments") or {}
+    replicasets = raw.get("replicasets") or {}
     pods = raw.get("pods") or {}
     nodes = raw.get("nodes") or {}
     pod_metrics = raw.get("pod_metrics") or {}
     node_metrics = raw.get("node_metrics") or {}
+
+    # ReplicaSet -> owning Deployment, so we can roll pod usage up to a deployment.
+    # (Pods are owned by a ReplicaSet named "<deployment>-<hash>", which is in turn
+    # owned by the Deployment.)
+    rs_to_dep = {}
+    for rs in replicasets.get("items", []):
+        ns = rs["metadata"]["namespace"]
+        dep = next((o["name"] for o in rs["metadata"].get("ownerReferences", [])
+                    if o.get("kind") == "Deployment"), None)
+        if dep:
+            rs_to_dep[(ns, rs["metadata"]["name"])] = dep
 
     pod_usage = {}
     for it in pod_metrics.get("items", []):
@@ -138,12 +157,17 @@ def build_model_from_raw(raw: dict) -> dict:
         })
 
     pod_rows = []
+    dep_usage = {}  # (ns, deployment) -> [cpu_m, mem_b] summed actual usage of its pods
     for p in pods.get("items", []):
         ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
         spec = p.get("spec", {})
         node = spec.get("nodeName", "<unscheduled>")
         phase = p.get("status", {}).get("phase", "?")
-        owner = next((f'{o["kind"]}/{o["name"]}' for o in p["metadata"].get("ownerReferences", [])), "-")
+        refs = p["metadata"].get("ownerReferences", [])
+        owner = next((f'{o["kind"]}/{o["name"]}' for o in refs), "-")
+        # Attribute this pod's usage to a Deployment (via its ReplicaSet owner).
+        dep_name = next((rs_to_dep.get((ns, o["name"])) for o in refs
+                         if o.get("kind") == "ReplicaSet" and (ns, o["name"]) in rs_to_dep), None)
         cpu_req = cpu_lim = mem_req = mem_lim = 0.0
         missing = 0
         conts = spec.get("containers", [])
@@ -162,6 +186,10 @@ def build_model_from_raw(raw: dict) -> dict:
             "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
             "cpu_used_m": u[0], "mem_used_b": u[1], "missing_limits": missing,
         })
+        if dep_name and u[0] is not None:
+            acc = dep_usage.setdefault((ns, dep_name), [0.0, 0.0])
+            acc[0] += u[0]
+            acc[1] += u[1]
 
     dep_rows = []
     for d in deployments.get("items", []):
@@ -181,10 +209,13 @@ def build_model_from_raw(raw: dict) -> dict:
             if not req.get("memory"): missing.append(f'{c["name"]}:mem-req')
             if not lim.get("cpu"): missing.append(f'{c["name"]}:cpu-lim')
             if not lim.get("memory"): missing.append(f'{c["name"]}:mem-lim')
+        used = dep_usage.get((ns, name))
         dep_rows.append({
             "namespace": ns, "deployment": name, "replicas": replicas, "ready": ready,
             "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
             "cpu_req_total_m": cpu_req * replicas, "mem_req_total_b": mem_req * replicas,
+            "cpu_used_m": used[0] if used else None,
+            "mem_used_b": used[1] if used else None,
             "missing": ", ".join(missing),
         })
 
@@ -203,6 +234,15 @@ class Dashboard(tk.Tk):
         self.model = {}
         self._result_q: queue.Queue = queue.Queue()
         self._busy = False
+        self._analysis_frames: list = []
+
+        # Trends / history capture state
+        self._history_path = folder / trends.HISTORY_FILENAME
+        self._history = trends.load_samples(self._history_path)
+        self._cap_running = False
+        self._cap_after_id = None
+        self._cap_q: queue.Queue = queue.Queue()
+        self._cap_busy = False
 
         # --- Row 1: live cluster (kubectl on your PATH) -----------------------
         live = ttk.Frame(self, padding=(6, 6, 6, 2))
@@ -238,6 +278,9 @@ class Dashboard(tk.Tk):
 
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Persistent Trends tab (never torn down by data reloads).
+        self._build_trends_tab()
 
         self.load_contexts()
         # Always start empty — never auto-load a cached snapshot. The user picks a
@@ -306,7 +349,8 @@ class Dashboard(tk.Tk):
         folder = Path(self.path_var.get())
         folder.mkdir(parents=True, exist_ok=True)
         names = {
-            "deployments": "deployments.json", "pods": "pods.json", "nodes": "nodes.json",
+            "deployments": "deployments.json", "replicasets": "replicasets.json",
+            "pods": "pods.json", "nodes": "nodes.json",
             "pod_metrics": "pod-metrics.json", "node_metrics": "node-metrics.json",
         }
         for key, fname in names.items():
@@ -335,12 +379,18 @@ class Dashboard(tk.Tk):
                  + (f"  ·  {source}" if source else "")
                  + ("" if has_metrics else "  ·  no metrics-server (usage blank)")
         )
-        for tab in self.nb.tabs():
-            self.nb.forget(tab)
+        # Rebuild only the data tabs; leave the persistent Trends tab intact.
+        for f in self._analysis_frames:
+            self.nb.forget(f)
+            f.destroy()
+        self._analysis_frames = []
         self._build_nodes_tab()
         self._build_deploys_tab()
         self._build_pods_tab()
         self._build_offenders_tab()
+        # Keep Trends as the last tab.
+        self.nb.insert("end", self._trends_frame)
+        self._trends_refresh_namespaces()
 
     # -- helpers -----------------------------------------------------------
     def _make_tree(self, parent, columns, widths=None):
@@ -376,6 +426,7 @@ class Dashboard(tk.Tk):
     def _build_nodes_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Nodes")
+        self._analysis_frames.append(frame)
 
         # aggregate pod requests per node
         agg = {}
@@ -430,6 +481,7 @@ class Dashboard(tk.Tk):
     def _build_deploys_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Deployments")
+        self._analysis_frames.append(frame)
         cols = ("namespace", "deployment", "replicas", "cpu req/pod", "cpu lim/pod",
                 "mem req/pod", "mem lim/pod", "cpu req TOTAL", "mem req TOTAL", "missing")
         tree = self._make_tree(frame, cols, [110, 200, 80, 90, 90, 90, 90, 95, 95, 160])
@@ -446,6 +498,7 @@ class Dashboard(tk.Tk):
     def _build_pods_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Pods")
+        self._analysis_frames.append(frame)
         bar = ttk.Frame(frame, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="Filter:").pack(side="left")
@@ -476,6 +529,7 @@ class Dashboard(tk.Tk):
     def _build_offenders_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Biggest offenders")
+        self._analysis_frames.append(frame)
         ttk.Label(frame, padding=6, text=(
             "Pods reserving far more memory than they use — the over-provisioning that "
             "forces new nodes. Scheduling uses requests, not usage.")).pack(anchor="w")
@@ -493,6 +547,168 @@ class Dashboard(tk.Tk):
             ))
         if not rows:
             ttk.Label(frame, padding=6, text="No metrics-server data available.").pack(anchor="w")
+
+    # -- Trends tab (time series) ------------------------------------------
+    def _build_trends_tab(self):
+        frame = ttk.Frame(self.nb)
+        self._trends_frame = frame
+        self.nb.add(frame, text="Trends")
+
+        ttk.Label(frame, padding=(6, 6, 6, 0), text=(
+            "Leave the app running to record deployment resource use over time, then "
+            "graph it. Solid line = actual usage, dashed = requested (reserved). "
+            "One line per deployment in the selected namespace.")).pack(anchor="w")
+
+        # controls
+        ctl = ttk.Frame(frame, padding=6)
+        ctl.pack(fill="x")
+        ttk.Label(ctl, text="Interval:").pack(side="left")
+        self.trends_interval = tk.StringVar(value="15 min")
+        ttk.Combobox(ctl, textvariable=self.trends_interval, width=8, state="readonly",
+                     values=list(_INTERVALS)).pack(side="left", padx=(2, 10))
+        self.trends_cap_btn = ttk.Button(ctl, text="▶ Start capture",
+                                         command=self._trends_toggle_capture)
+        self.trends_cap_btn.pack(side="left")
+
+        ttk.Separator(ctl, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Label(ctl, text="Namespace:").pack(side="left")
+        self.trends_ns = tk.StringVar()
+        self.trends_ns_box = ttk.Combobox(ctl, textvariable=self.trends_ns, width=22,
+                                          state="readonly")
+        self.trends_ns_box.pack(side="left", padx=2)
+        self.trends_ns_box.bind("<<ComboboxSelected>>", lambda e: self._trends_redraw())
+
+        ttk.Label(ctl, text="Metric:").pack(side="left", padx=(10, 0))
+        self.trends_metric = tk.StringVar(value="Memory")
+        mb = ttk.Combobox(ctl, textvariable=self.trends_metric, width=8, state="readonly",
+                          values=["Memory", "CPU"])
+        mb.pack(side="left", padx=2)
+        mb.bind("<<ComboboxSelected>>", lambda e: self._trends_redraw())
+
+        self.trends_show_used = tk.BooleanVar(value=True)
+        self.trends_show_req = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ctl, text="usage", variable=self.trends_show_used,
+                        command=self._trends_redraw).pack(side="left", padx=(10, 2))
+        ttk.Checkbutton(ctl, text="request", variable=self.trends_show_req,
+                        command=self._trends_redraw).pack(side="left")
+
+        self.trends_status = ttk.Label(frame, padding=(6, 0), text="")
+        self.trends_status.pack(anchor="w")
+
+        self.trends_chart = trends.LineChart(frame, height=420)
+        self.trends_chart.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self._trends_refresh_namespaces()
+        self._trends_update_status()
+        self._trends_redraw()
+
+    def _trends_toggle_capture(self):
+        if self._cap_running:
+            self._cap_running = False
+            if self._cap_after_id is not None:
+                self.after_cancel(self._cap_after_id)
+                self._cap_after_id = None
+            self.trends_cap_btn.config(text="▶ Start capture")
+            self._trends_update_status()
+            return
+        if kubectl_collect.kubectl_path() is None:
+            messagebox.showerror("kubectl not found",
+                                 "Capture needs kubectl on your PATH (or the KUBECTL env var).")
+            return
+        self._cap_running = True
+        self.trends_cap_btn.config(text="■ Stop capture")
+        self._capture_tick()  # take one sample immediately, then on the interval
+
+    def _capture_tick(self):
+        if not self._cap_running or self._cap_busy:
+            return
+        self._cap_busy = True
+        ctx = self.context_var.get().strip()
+        self._trends_update_status(extra="  ·  ⏳ capturing…")
+
+        def work():
+            try:
+                raw = kubectl_collect.collect(ctx)
+                self._cap_q.put(("ok", raw))
+            except Exception as e:  # noqa: BLE001
+                self._cap_q.put(("err", e))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll_capture)
+
+    def _poll_capture(self):
+        try:
+            kind, payload = self._cap_q.get_nowait()
+        except queue.Empty:
+            self.after(100, self._poll_capture)
+            return
+
+        self._cap_busy = False
+        if kind == "ok":
+            model = build_model_from_raw(payload)
+            recs = trends.samples_from_model(model)
+            trends.append_samples(self._history_path, recs)
+            self._history.extend(recs)
+            self._trends_refresh_namespaces()
+            self._trends_redraw()
+            self._trends_update_status()
+        else:
+            self._trends_update_status(extra=f"  ·  ⚠ {payload}")
+
+        # schedule the next tick if still running
+        if self._cap_running:
+            ms = _INTERVALS[self.trends_interval.get()]
+            self._cap_after_id = self.after(ms, self._capture_tick)
+
+    def _trends_update_status(self, extra: str = ""):
+        n = len(self._history)
+        times = sorted({r["ts"] for r in self._history})
+        span = ""
+        if times:
+            span = (f" spanning {time.strftime('%H:%M', time.localtime(times[0]))}"
+                    f"–{time.strftime('%H:%M', time.localtime(times[-1]))}")
+        state = "capturing" if self._cap_running else "stopped"
+        self.trends_status.config(
+            text=f"{len(times)} samples · {n} records{span} · {state}{extra}")
+
+    def _trends_refresh_namespaces(self):
+        namespaces = trends.namespaces_in(self._history)
+        self.trends_ns_box["values"] = namespaces
+        if namespaces and self.trends_ns.get() not in namespaces:
+            self.trends_ns.set(namespaces[0])
+
+    def _trends_redraw(self):
+        if not hasattr(self, "trends_chart"):
+            return
+        ns = self.trends_ns.get()
+        metric = self.trends_metric.get()
+        used_key = "mem_used_b" if metric == "Memory" else "cpu_used_m"
+        req_key = "mem_req_b" if metric == "Memory" else "cpu_req_m"
+        if metric == "Memory":
+            scale = 1024 ** 2  # -> MiB
+            y_fmt = lambda v: f"{v/1024:.1f}Gi" if v >= 1024 else f"{v:.0f}Mi"
+        else:
+            scale = 1.0  # millicores
+            y_fmt = lambda v: f"{v/1000:.2f}c" if v >= 1000 else f"{v:.0f}m"
+
+        recs = [r for r in self._history if r["ns"] == ns]
+        deps = sorted({r["dep"] for r in recs})
+        series = []
+        for i, dep in enumerate(deps):
+            color = trends.color_for(i)
+            drecs = sorted((r for r in recs if r["dep"] == dep), key=lambda r: r["ts"])
+            if self.trends_show_used.get():
+                pts = [(r["ts"], r[used_key] / scale) for r in drecs if r.get(used_key) is not None]
+                if pts:
+                    series.append({"label": dep, "color": color, "dash": False, "points": pts})
+            if self.trends_show_req.get():
+                pts = [(r["ts"], r[req_key] / scale) for r in drecs if r.get(req_key) is not None]
+                if pts:
+                    series.append({"label": dep, "color": color, "dash": True, "points": pts})
+
+        msg = ("No data yet — pick a context above and hit “Start capture”."
+               if not self._history else f"No records for namespace “{ns}”.")
+        self.trends_chart.set_series(series, y_fmt=y_fmt, empty_msg=msg)
 
 
 def main():
