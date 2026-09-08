@@ -240,14 +240,14 @@ class Dashboard(tk.Tk):
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         self.load_contexts()
-        # Show cached files at startup if present; otherwise prompt to refresh.
-        if (folder / "pods.json").exists():
-            self.reload()
-        elif kubectl_collect.kubectl_path():
-            self.status.config(text="Pick a context and hit “Refresh from cluster”.")
+        # Always start empty — never auto-load a cached snapshot. The user picks a
+        # context and refreshes live, or explicitly clicks "Load files" for a snapshot.
+        cached = " (cached snapshot available — “Load files”)" if (folder / "pods.json").exists() else ""
+        if kubectl_collect.kubectl_path():
+            self.status.config(text="Pick a context and hit “Refresh from cluster”." + cached)
         else:
             self.status.config(text="⚠ kubectl not found on PATH — load JSON files, "
-                                     "or install kubectl / set the KUBECTL env var.")
+                                     "or install kubectl / set the KUBECTL env var." + cached)
 
     # -- live cluster ------------------------------------------------------
     def load_contexts(self):
