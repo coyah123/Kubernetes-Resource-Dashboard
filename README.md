@@ -67,6 +67,21 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
 - **Pods** — filter by namespace/node
 - **Biggest offenders** — pods reserving far more memory than they actually use
 
+**Reading the colors** — a **dark-red row** is a warning flag. What it means
+depends on the tab:
+- **Nodes** — the node is **over 85% requested** on CPU *or* memory. The
+  scheduler sees it as nearly full and can't place many more pods there (even if
+  actual usage is low) — these are the nodes at risk of forcing a new node to
+  spin up.
+- **Deployments** — the deployment is **missing at least one request or limit**.
+  The exact gaps are listed in the **"missing"** column (e.g. `web:cpu-lim`).
+- **Pods** (and the per-node pod popup) — the pod has **at least one container
+  with no CPU or memory limit**. The Pods tab also marks these with ⚠ in the
+  "no lim" column.
+
+The **Biggest offenders** tab has no red highlight — it's already sorted
+worst-first by wasted (requested − used) memory, so every row is an offender.
+
 **Non-standard kubectl** — if your cluster needs a wrapper (e.g. k3s on a Pi),
 set the `KUBECTL` environment variable before launching:
 
