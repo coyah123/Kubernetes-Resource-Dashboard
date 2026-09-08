@@ -82,17 +82,19 @@ depends on the tab:
 The **Biggest offenders** tab has no red highlight — it's already sorted
 worst-first by wasted (requested − used) memory, so every row is an offender.
 
-**Non-standard kubectl** — if your cluster needs a wrapper (e.g. k3s on a Pi),
-set the `KUBECTL` environment variable before launching:
+**Custom kubectl command (optional)** — by default the app runs plain `kubectl`
+from your PATH, which is all most people need. If you have to invoke kubectl
+differently — a full path, a differently-named binary, or a wrapper — set the
+`KUBECTL` environment variable before launching:
 
 ```powershell
-# Windows (PowerShell)
-$env:KUBECTL = "wsl sudo k3s kubectl"; py k8s_dashboard_gui.py
+# Windows (PowerShell) — example: a kubectl not on PATH
+$env:KUBECTL = "C:\tools\kubectl.exe"; py k8s_dashboard_gui.py
 ```
 
 ```bash
-# macOS / Linux
-KUBECTL="sudo k3s kubectl" python3 k8s_dashboard_gui.py
+# macOS / Linux — example: a versioned or wrapped binary
+KUBECTL="kubectl.custom" python3 k8s_dashboard_gui.py
 ```
 
 **Offline / web variant** — `app.py` is an optional Streamlit web version that
@@ -103,9 +105,9 @@ machines where you'd rather dump JSON separately.
 ## Kubernetes commands used
 
 Everything the dashboard shows comes from these read-only `kubectl` calls. Run any
-of them yourself to manually verify what the app reports. (Prefix with your wrapper
-if you use one, e.g. `sudo k3s kubectl ...`, and add `--context <name>` to target a
-specific cluster.)
+of them yourself to manually verify what the app reports. (Add `--context <name>`
+to target a specific cluster, and substitute your own kubectl invocation if you set
+the `KUBECTL` override.)
 
 **Discover contexts** — populates the dropdown:
 
@@ -166,8 +168,9 @@ kubectl top nodes                                         # human-readable equiv
   - macOS: `brew install python-tk` (match your version, e.g. `python-tk@3.12`),
     or reinstall Python from python.org which includes it.
   - Debian/Ubuntu: `sudo apt install python3-tk`. Fedora: `sudo dnf install python3-tkinter`.
-- **"kubectl not found on PATH"** — install kubectl, or if it lives under a
-  wrapper (e.g. k3s), launch with `KUBECTL="sudo k3s kubectl" python k8s_dashboard_gui.py`.
+- **"kubectl not found on PATH"** — install kubectl, or if it's installed under a
+  different name/path, point the app at it with the `KUBECTL` env var (see
+  **Custom kubectl command** in Usage).
 - **Context dropdown is empty** — you have no kubeconfig. Set one up (or set the
   `KUBECONFIG` env var to point at the right file) and click **Reload contexts**.
 - **Refresh fails with "connection refused" / timeout** — the cluster's API server
