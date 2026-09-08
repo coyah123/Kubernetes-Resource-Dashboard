@@ -1,0 +1,6 @@
+# Collected cluster snapshots — may contain sensitive infra details, never commit.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
