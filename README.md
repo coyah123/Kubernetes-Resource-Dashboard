@@ -90,6 +90,10 @@ runs just `kubectl get pods -n kube-system` and redraws that list. The
 tabs have always refreshed per-type. **Overview** is the exception — it summarizes
 every kind, so its refresh does the full "Refresh from cluster".
 
+> Note: the **Nodes** refresh updates node capacity/usage only. The per-node
+> "pods" count and "req %" columns are derived from the current pod model, so
+> refresh **Pods** (or do a full cluster refresh) to bring those in sync.
+
 Rows across the app share one interaction model:
 
 - **Double-click** a row → its detail opens **in-place** in the same tab, with a
