@@ -133,6 +133,107 @@ def build_model(folder: Path) -> dict:
     })
 
 
+def build_pod_row(p: dict, usage=(None, None)) -> dict:
+    """One pod's row dict (the shape every pod table consumes). `usage` is the
+    (cpu_millicores, mem_bytes) from metrics-server, or (None, None) if absent."""
+    ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
+    spec = p.get("spec", {})
+    status = p.get("status", {})
+    node = spec.get("nodeName", "<unscheduled>")
+    phase = status.get("phase", "?")
+    cstatuses = status.get("containerStatuses", [])
+    n_ready = sum(1 for cs in cstatuses if cs.get("ready"))
+    n_total = len(spec.get("containers", []))
+    restarts = sum(cs.get("restartCount", 0) for cs in cstatuses)
+    # Human-readable reason a pod is unhealthy (empty string == healthy).
+    reasons = []
+    for cs in cstatuses:
+        cstate = cs.get("state", {})
+        w, t = cstate.get("waiting"), cstate.get("terminated")
+        if w and w.get("reason"):
+            reasons.append(w["reason"])
+        elif t and t.get("reason") and t.get("exitCode"):
+            reasons.append(t["reason"])
+    note_parts = []
+    if phase not in ("Running", "Succeeded"):
+        note_parts.append(phase)
+    for r in dict.fromkeys(reasons):
+        if r not in note_parts:
+            note_parts.append(r)
+    if restarts:
+        note_parts.append(f"{restarts} restart" + ("s" if restarts != 1 else ""))
+    owner = next((f'{o["kind"]}/{o["name"]}' for o in p["metadata"].get("ownerReferences", [])), "-")
+    cpu_req = cpu_lim = mem_req = mem_lim = 0.0
+    missing = 0
+    for c in spec.get("containers", []):
+        res = c.get("resources", {})
+        req, lim = res.get("requests", {}), res.get("limits", {})
+        cpu_req += cpu_to_milli(req.get("cpu"))
+        mem_req += mem_to_bytes(req.get("memory"))
+        cpu_lim += cpu_to_milli(lim.get("cpu"))
+        mem_lim += mem_to_bytes(lim.get("memory"))
+        if not lim.get("cpu") or not lim.get("memory"):
+            missing += 1
+    return {
+        "namespace": ns, "pod": name, "node": node, "phase": phase, "owner": owner,
+        "ready": f"{n_ready}/{n_total}", "restarts": restarts,
+        "age": age_from(p["metadata"].get("creationTimestamp")),
+        "pod_ip": status.get("podIP", "—"), "status_note": ", ".join(note_parts),
+        "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
+        "cpu_used_m": usage[0], "mem_used_b": usage[1], "missing_limits": missing,
+    }
+
+
+def build_node_row(n: dict, usage=(None, None)) -> dict:
+    alloc = n["status"].get("allocatable", {})
+    ready = next((c["status"] for c in n["status"].get("conditions", [])
+                  if c["type"] == "Ready"), "?")
+    return {
+        "node": n["metadata"]["name"], "ready": ready,
+        "cpu_alloc_m": cpu_to_milli(alloc.get("cpu")),
+        "mem_alloc_b": mem_to_bytes(alloc.get("memory")),
+        "cpu_used_m": usage[0], "mem_used_b": usage[1],
+    }
+
+
+def build_dep_row(d: dict, used=None) -> dict:
+    ns, name = d["metadata"]["namespace"], d["metadata"]["name"]
+    replicas = d["spec"].get("replicas", 1)
+    ready = d.get("status", {}).get("readyReplicas", 0)
+    cpu_req = cpu_lim = mem_req = mem_lim = 0.0
+    missing = []
+    for c in d["spec"]["template"]["spec"].get("containers", []):
+        res = c.get("resources", {})
+        req, lim = res.get("requests", {}), res.get("limits", {})
+        cpu_req += cpu_to_milli(req.get("cpu"))
+        mem_req += mem_to_bytes(req.get("memory"))
+        cpu_lim += cpu_to_milli(lim.get("cpu"))
+        mem_lim += mem_to_bytes(lim.get("memory"))
+        if not req.get("cpu"): missing.append(f'{c["name"]}:cpu-req')
+        if not req.get("memory"): missing.append(f'{c["name"]}:mem-req')
+        if not lim.get("cpu"): missing.append(f'{c["name"]}:cpu-lim')
+        if not lim.get("memory"): missing.append(f'{c["name"]}:mem-lim')
+    return {
+        "namespace": ns, "deployment": name, "replicas": replicas, "ready": ready,
+        "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
+        "cpu_req_total_m": cpu_req * replicas, "mem_req_total_b": mem_req * replicas,
+        "cpu_used_m": used[0] if used else None,
+        "mem_used_b": used[1] if used else None,
+        "missing": ", ".join(missing),
+    }
+
+
+def usage_map_from_metrics(pod_metrics: dict) -> dict:
+    """(namespace, pod) -> (cpu_millicores, mem_bytes) from a pod metrics list."""
+    out = {}
+    for it in pod_metrics.get("items", []):
+        ns, name = it["metadata"]["namespace"], it["metadata"]["name"]
+        cpu = sum(cpu_to_milli(c.get("usage", {}).get("cpu")) for c in it.get("containers", []))
+        mem = sum(mem_to_bytes(c.get("usage", {}).get("memory")) for c in it.get("containers", []))
+        out[(ns, name)] = (cpu, mem)
+    return out
+
+
 def build_model_from_raw(raw: dict) -> dict:
     """Build the model from the five parsed kubectl JSON objects (live or cached)."""
     deployments = raw.get("deployments") or {}
@@ -153,13 +254,7 @@ def build_model_from_raw(raw: dict) -> dict:
         if dep:
             rs_to_dep[(ns, rs["metadata"]["name"])] = dep
 
-    pod_usage = {}
-    for it in pod_metrics.get("items", []):
-        ns, name = it["metadata"]["namespace"], it["metadata"]["name"]
-        cpu = sum(cpu_to_milli(c.get("usage", {}).get("cpu")) for c in it.get("containers", []))
-        mem = sum(mem_to_bytes(c.get("usage", {}).get("memory")) for c in it.get("containers", []))
-        pod_usage[(ns, name)] = (cpu, mem)
-
+    pod_usage = usage_map_from_metrics(pod_metrics)
     node_usage = {}
     for it in node_metrics.get("items", []):
         node_usage[it["metadata"]["name"]] = (
@@ -167,111 +262,27 @@ def build_model_from_raw(raw: dict) -> dict:
             mem_to_bytes(it.get("usage", {}).get("memory")),
         )
 
-    node_rows = []
-    for n in nodes.get("items", []):
-        name = n["metadata"]["name"]
-        alloc = n["status"].get("allocatable", {})
-        ready = next((c["status"] for c in n["status"].get("conditions", []) if c["type"] == "Ready"), "?")
-        u = node_usage.get(name, (None, None))
-        node_rows.append({
-            "node": name, "ready": ready,
-            "cpu_alloc_m": cpu_to_milli(alloc.get("cpu")),
-            "mem_alloc_b": mem_to_bytes(alloc.get("memory")),
-            "cpu_used_m": u[0], "mem_used_b": u[1],
-        })
+    node_rows = [build_node_row(n, node_usage.get(n["metadata"]["name"], (None, None)))
+                 for n in nodes.get("items", [])]
 
     pod_rows = []
     dep_usage = {}  # (ns, deployment) -> [cpu_m, mem_b] summed actual usage of its pods
     for p in pods.get("items", []):
         ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
-        spec = p.get("spec", {})
-        status = p.get("status", {})
-        node = spec.get("nodeName", "<unscheduled>")
-        phase = status.get("phase", "?")
-        cstatuses = status.get("containerStatuses", [])
-        n_ready = sum(1 for cs in cstatuses if cs.get("ready"))
-        n_total = len(spec.get("containers", []))
-        ready_str = f"{n_ready}/{n_total}"
-        restarts = sum(cs.get("restartCount", 0) for cs in cstatuses)
-        age = age_from(p["metadata"].get("creationTimestamp"))
-        pod_ip = status.get("podIP", "—")
-        # Human-readable reason a pod is unhealthy: waiting/terminated container
-        # reasons (CrashLoopBackOff, ImagePullBackOff, …), a non-Running phase,
-        # and a restart count. Empty string == healthy (no red flag).
-        reasons = []
-        for cs in cstatuses:
-            cstate = cs.get("state", {})
-            w, t = cstate.get("waiting"), cstate.get("terminated")
-            if w and w.get("reason"):
-                reasons.append(w["reason"])
-            elif t and t.get("reason") and t.get("exitCode"):
-                reasons.append(t["reason"])
-        note_parts = []
-        if phase not in ("Running", "Succeeded"):
-            note_parts.append(phase)
-        for r in dict.fromkeys(reasons):
-            if r not in note_parts:
-                note_parts.append(r)
-        if restarts:
-            note_parts.append(f"{restarts} restart" + ("s" if restarts != 1 else ""))
-        status_note = ", ".join(note_parts)
-        refs = p["metadata"].get("ownerReferences", [])
-        owner = next((f'{o["kind"]}/{o["name"]}' for o in refs), "-")
+        row = build_pod_row(p, pod_usage.get((ns, name), (None, None)))
+        pod_rows.append(row)
         # Attribute this pod's usage to a Deployment (via its ReplicaSet owner).
+        refs = p["metadata"].get("ownerReferences", [])
         dep_name = next((rs_to_dep.get((ns, o["name"])) for o in refs
                          if o.get("kind") == "ReplicaSet" and (ns, o["name"]) in rs_to_dep), None)
-        cpu_req = cpu_lim = mem_req = mem_lim = 0.0
-        missing = 0
-        conts = spec.get("containers", [])
-        for c in conts:
-            res = c.get("resources", {})
-            req, lim = res.get("requests", {}), res.get("limits", {})
-            cpu_req += cpu_to_milli(req.get("cpu"))
-            mem_req += mem_to_bytes(req.get("memory"))
-            cpu_lim += cpu_to_milli(lim.get("cpu"))
-            mem_lim += mem_to_bytes(lim.get("memory"))
-            if not lim.get("cpu") or not lim.get("memory"):
-                missing += 1
-        u = pod_usage.get((ns, name), (None, None))
-        pod_rows.append({
-            "namespace": ns, "pod": name, "node": node, "phase": phase, "owner": owner,
-            "ready": ready_str, "restarts": restarts, "age": age, "pod_ip": pod_ip,
-            "status_note": status_note,
-            "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
-            "cpu_used_m": u[0], "mem_used_b": u[1], "missing_limits": missing,
-        })
-        if dep_name and u[0] is not None:
+        if dep_name and row["cpu_used_m"] is not None:
             acc = dep_usage.setdefault((ns, dep_name), [0.0, 0.0])
-            acc[0] += u[0]
-            acc[1] += u[1]
+            acc[0] += row["cpu_used_m"]
+            acc[1] += row["mem_used_b"]
 
-    dep_rows = []
-    for d in deployments.get("items", []):
-        ns, name = d["metadata"]["namespace"], d["metadata"]["name"]
-        replicas = d["spec"].get("replicas", 1)
-        ready = d.get("status", {}).get("readyReplicas", 0)
-        cpu_req = cpu_lim = mem_req = mem_lim = 0.0
-        missing = []
-        for c in d["spec"]["template"]["spec"].get("containers", []):
-            res = c.get("resources", {})
-            req, lim = res.get("requests", {}), res.get("limits", {})
-            cpu_req += cpu_to_milli(req.get("cpu"))
-            mem_req += mem_to_bytes(req.get("memory"))
-            cpu_lim += cpu_to_milli(lim.get("cpu"))
-            mem_lim += mem_to_bytes(lim.get("memory"))
-            if not req.get("cpu"): missing.append(f'{c["name"]}:cpu-req')
-            if not req.get("memory"): missing.append(f'{c["name"]}:mem-req')
-            if not lim.get("cpu"): missing.append(f'{c["name"]}:cpu-lim')
-            if not lim.get("memory"): missing.append(f'{c["name"]}:mem-lim')
-        used = dep_usage.get((ns, name))
-        dep_rows.append({
-            "namespace": ns, "deployment": name, "replicas": replicas, "ready": ready,
-            "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
-            "cpu_req_total_m": cpu_req * replicas, "mem_req_total_b": mem_req * replicas,
-            "cpu_used_m": used[0] if used else None,
-            "mem_used_b": used[1] if used else None,
-            "missing": ", ".join(missing),
-        })
+    dep_rows = [build_dep_row(d, dep_usage.get(
+        (d["metadata"]["namespace"], d["metadata"]["name"])))
+        for d in deployments.get("items", [])]
 
     return {"nodes": node_rows, "pods": pod_rows, "deployments": dep_rows}
 
@@ -527,11 +538,51 @@ class Dashboard(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _scoped_refresh(self, fetch_fn, apply_fn, status_lbl):
+        """
+        Re-fetch ONE tab's own resource live (fetch_fn, off-thread), then hand the
+        result to apply_fn on the UI thread. Unlike "Refresh from cluster", this
+        touches only the kind/scope the tab shows.
+        """
+        status_lbl.config(text="⏳ refreshing…")
+
+        def work():
+            try:
+                data = fetch_fn()
+            except Exception as e:  # noqa: BLE001
+                self.after(0, lambda err=e: status_lbl.config(text=f"⚠ {err}"))
+                return
+            self.after(0, lambda: done(data))
+
+        def done(data):
+            try:
+                apply_fn(data)
+            except Exception as e:  # noqa: BLE001
+                status_lbl.config(text=f"⚠ {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _node_usage_map(self, context):
+        nu = {}
+        for it in kubectl_collect.node_metrics(context).get("items", []):
+            nu[it["metadata"]["name"]] = (
+                cpu_to_milli(it.get("usage", {}).get("cpu")),
+                mem_to_bytes(it.get("usage", {}).get("memory")))
+        return nu
+
     # -- tabs --------------------------------------------------------------
     def _build_overview_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="🏠 Overview")
         self._analysis_frames.append(frame)
+
+        # Overview summarizes every kind, so its refresh is the full cluster pull.
+        topbar = ttk.Frame(frame, padding=4)
+        topbar.pack(fill="x")
+        ttk.Button(topbar, text="⟳ Refresh from cluster",
+                   command=self.refresh_from_cluster).pack(side="left")
+        ttk.Label(topbar, text="(whole-cluster summary — refreshes everything)"
+                  ).pack(side="left", padx=8)
 
         pods = self.model["pods"]
         nodes = self.model["nodes"]
@@ -621,13 +672,25 @@ class Dashboard(tk.Tk):
         list_frame = ttk.Frame(frame)
         list_frame.pack(fill="both", expand=True)
 
-        # aggregate pod requests per node
-        agg = {}
-        for p in self.model["pods"]:
-            a = agg.setdefault(p["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
-            a["pods"] += 1
-            a["cpu"] += p["cpu_req_m"]
-            a["mem"] += p["mem_req_b"]
+        ctx = lambda: self.context_var.get().strip()
+        bar = ttk.Frame(list_frame, padding=4)
+        bar.pack(fill="x")
+        status = ttk.Label(bar, text="")
+
+        def do_refresh():
+            def fetch():
+                nodes = kubectl_collect.list_items("nodes", context=ctx())
+                nu = self._node_usage_map(ctx())
+                return [build_node_row(n, nu.get(n["metadata"]["name"], (None, None)))
+                        for n in nodes]
+
+            def apply(rows):
+                self.model["nodes"] = rows
+                refill()
+            self._scoped_refresh(fetch, apply, status)
+
+        ttk.Button(bar, text="⟳ Refresh nodes", command=do_refresh).pack(side="left")
+        status.pack(side="left", padx=8)
 
         cols = ("open", "node", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
                 "mem alloc", "mem req%", "mem used%", "⚠ why")
@@ -635,33 +698,43 @@ class Dashboard(tk.Tk):
                                [40, 150, 70, 55, 90, 80, 80, 90, 80, 80, 200])
         tree.heading("open", text="⧉")
         tree.column("open", anchor="center", stretch=False)
-        for n in self.model["nodes"]:
-            a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
-            req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
-            req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
-            why = []
-            if req_cpu_p > 85:
-                why.append(f"CPU {req_cpu_p:.0f}% requested")
-            if req_mem_p > 85:
-                why.append(f"mem {req_mem_p:.0f}% requested")
-            if n["ready"] != "True":
-                why.append(f"NotReady ({n['ready']})")
-            tag = "warn" if why else ""
-            tree.insert("", "end", tags=(tag,), values=(
-                "⧉", n["node"], n["ready"], a["pods"],
-                fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
-                pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
-                fmt_mem(n["mem_alloc_b"]), f"{req_mem_p:.0f}%",
-                pct(n["mem_used_b"], n["mem_alloc_b"]) if n["mem_used_b"] is not None else "—",
-                "; ".join(why),
-            ))
+
+        def refill():
+            for r in tree.get_children(""):
+                tree.delete(r)
+            # aggregate pod requests per node (from the current pod model)
+            agg = {}
+            for p in self.model["pods"]:
+                a = agg.setdefault(p["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
+                a["pods"] += 1
+                a["cpu"] += p["cpu_req_m"]
+                a["mem"] += p["mem_req_b"]
+            for n in self.model["nodes"]:
+                a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
+                req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
+                req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
+                why = []
+                if req_cpu_p > 85:
+                    why.append(f"CPU {req_cpu_p:.0f}% requested")
+                if req_mem_p > 85:
+                    why.append(f"mem {req_mem_p:.0f}% requested")
+                if n["ready"] != "True":
+                    why.append(f"NotReady ({n['ready']})")
+                tree.insert("", "end", tags=("warn" if why else "",), values=(
+                    "⧉", n["node"], n["ready"], a["pods"],
+                    fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
+                    pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
+                    fmt_mem(n["mem_alloc_b"]), f"{req_mem_p:.0f}%",
+                    pct(n["mem_used_b"], n["mem_alloc_b"]) if n["mem_used_b"] is not None else "—",
+                    "; ".join(why),
+                ))
+        refill()
 
         ttk.Label(list_frame, text="Double-click a node for its details, events, and the "
                   "pods running on it — click ⧉ to open in a new window. Red = over 85% "
                   "requested (scheduler sees it as nearly full) or NotReady; see the "
                   "“⚠ why” column.", padding=4).pack(anchor="w")
 
-        ctx = lambda: self.context_var.get().strip()
         wire_row_actions(
             tree,
             lambda row: ResourceDetailWindow(self, "nodes", tree.set(row, "node"), "", ctx()),
@@ -683,6 +756,29 @@ class Dashboard(tk.Tk):
         ns_box = ttk.Combobox(bar, textvariable=ns_var, width=26, state="readonly",
                               values=namespaces)
         ns_box.pack(side="left", padx=4)
+        ctx = lambda: self.context_var.get().strip()
+
+        def do_refresh():
+            ns = ns_var.get()
+            allns = ns == "(all)"
+
+            def fetch():
+                items = kubectl_collect.list_items(
+                    "deployments", namespace="" if allns else ns,
+                    all_namespaces=allns, context=ctx())
+                return (ns, [build_dep_row(d) for d in items])
+
+            def apply(data):
+                scope, rows = data
+                if scope == "(all)":
+                    self.model["deployments"] = rows
+                else:
+                    self.model["deployments"] = [
+                        d for d in self.model["deployments"] if d["namespace"] != scope] + rows
+                refill()
+            self._scoped_refresh(fetch, apply, count_lbl)
+
+        ttk.Button(bar, text="⟳ Refresh", command=do_refresh).pack(side="left", padx=6)
         count_lbl = ttk.Label(bar, text="")
         count_lbl.pack(side="left", padx=8)
 
@@ -778,6 +874,24 @@ class Dashboard(tk.Tk):
         ttk.Label(bar, text="Filter:").pack(side="left")
         filt = tk.StringVar()
         ttk.Entry(bar, textvariable=filt, width=40).pack(side="left", padx=4)
+        ctx = lambda: self.context_var.get().strip()
+        refresh_status = ttk.Label(bar, text="")
+
+        def do_refresh():
+            def fetch():
+                items = kubectl_collect.list_items("pods", all_namespaces=True, context=ctx())
+                usage = usage_map_from_metrics(kubectl_collect.pod_metrics(ctx()))
+                return [build_pod_row(
+                    it, usage.get((it["metadata"]["namespace"], it["metadata"]["name"]),
+                                  (None, None))) for it in items]
+
+            def apply(rows):
+                self.model["pods"] = rows
+                refill()
+            self._scoped_refresh(fetch, apply, refresh_status)
+
+        ttk.Button(bar, text="⟳ Refresh pods", command=do_refresh).pack(side="left", padx=6)
+        refresh_status.pack(side="left", padx=6)
         cols = ("sel", "open", "namespace", "pod", "node", "phase", "cpu req", "cpu used",
                 "mem req", "mem used", "no lim", "⚠ why")
         tree = self._make_tree(list_frame, cols,
@@ -863,6 +977,27 @@ class Dashboard(tk.Tk):
         ns_box = ttk.Combobox(bar, textvariable=ns_var, width=28, state="readonly",
                               values=namespaces)
         ns_box.pack(side="left", padx=4)
+        ctx = lambda: self.context_var.get().strip()
+
+        def do_refresh():
+            ns = ns_var.get()
+            if not ns:
+                return
+
+            def fetch():
+                items = kubectl_collect.list_items("pods", namespace=ns, context=ctx())
+                return (ns, [build_pod_row(it) for it in items])
+
+            def apply(data):
+                scope, rows = data
+                # Replace only this namespace's pods in the model, then redraw.
+                self.model["pods"] = [
+                    p for p in self.model["pods"] if p["namespace"] != scope] + rows
+                refill()
+            self._scoped_refresh(fetch, apply, count_lbl)
+
+        ttk.Button(bar, text="⟳ Refresh namespace",
+                   command=do_refresh).pack(side="left", padx=6)
         count_lbl = ttk.Label(bar, text="")
         count_lbl.pack(side="left", padx=8)
 
@@ -960,23 +1095,52 @@ class Dashboard(tk.Tk):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Resource Management")
         self._analysis_frames.append(frame)
+        ctx = lambda: self.context_var.get().strip()
+
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        status = ttk.Label(bar, text="")
+
+        def do_refresh():
+            def fetch():
+                items = kubectl_collect.list_items("pods", all_namespaces=True, context=ctx())
+                usage = usage_map_from_metrics(kubectl_collect.pod_metrics(ctx()))
+                return [build_pod_row(
+                    it, usage.get((it["metadata"]["namespace"], it["metadata"]["name"]),
+                                  (None, None))) for it in items]
+
+            def apply(rows):
+                self.model["pods"] = rows
+                refill()
+            self._scoped_refresh(fetch, apply, status)
+
+        ttk.Button(bar, text="⟳ Refresh pods", command=do_refresh).pack(side="left")
+        status.pack(side="left", padx=8)
+
         ttk.Label(frame, padding=6, text=(
             "Pods reserving far more memory than they use — the over-provisioning that "
             "forces new nodes. Scheduling uses requests, not usage.")).pack(anchor="w")
         cols = ("namespace", "pod", "node", "mem req", "mem used", "mem WASTED",
                 "cpu req", "cpu used")
         tree = self._make_tree(frame, cols, [110, 240, 150, 90, 90, 100, 80, 80])
-        rows = [p for p in self.model["pods"] if p["mem_used_b"] is not None]
-        rows.sort(key=lambda p: p["mem_req_b"] - (p["mem_used_b"] or 0), reverse=True)
-        for p in rows[:40]:
-            waste = p["mem_req_b"] - (p["mem_used_b"] or 0)
-            tree.insert("", "end", values=(
-                p["namespace"], p["pod"], p["node"], fmt_mem(p["mem_req_b"]),
-                fmt_mem(p["mem_used_b"]), fmt_mem(waste),
-                fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
-            ))
-        if not rows:
-            ttk.Label(frame, padding=6, text="No metrics-server data available.").pack(anchor="w")
+        empty = ttk.Label(frame, padding=6, text="No metrics-server data available.")
+
+        def refill():
+            for r in tree.get_children(""):
+                tree.delete(r)
+            rows = [p for p in self.model["pods"] if p["mem_used_b"] is not None]
+            rows.sort(key=lambda p: p["mem_req_b"] - (p["mem_used_b"] or 0), reverse=True)
+            for p in rows[:40]:
+                waste = p["mem_req_b"] - (p["mem_used_b"] or 0)
+                tree.insert("", "end", values=(
+                    p["namespace"], p["pod"], p["node"], fmt_mem(p["mem_req_b"]),
+                    fmt_mem(p["mem_used_b"]), fmt_mem(waste),
+                    fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
+                ))
+            empty.pack_forget()
+            if not rows:
+                empty.pack(anchor="w")
+        refill()
 
     # -- Trends tab (time series) ------------------------------------------
     def _build_trends_tab(self):

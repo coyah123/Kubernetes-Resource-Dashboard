@@ -82,6 +82,14 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
 
 ### Inspecting & acting on resources
 
+**Per-tab refresh** — every tab has its own **⟳ Refresh** that re-fetches *only
+that tab's resource*, scoped to the current filter, instead of re-pulling the whole
+cluster. E.g. on **Pods by namespace**, refreshing while viewing `kube-system`
+runs just `kubectl get pods -n kube-system` and redraws that list. The
+**Deployments** and **Pods** refreshes are likewise scoped; the grouped browser
+tabs have always refreshed per-type. **Overview** is the exception — it summarizes
+every kind, so its refresh does the full "Refresh from cluster".
+
 Rows across the app share one interaction model:
 
 - **Double-click** a row → its detail opens **in-place** in the same tab, with a

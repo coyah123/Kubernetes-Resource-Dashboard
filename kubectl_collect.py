@@ -156,6 +156,24 @@ def list_items(ktype: str, *, namespace: str = "", all_namespaces: bool = False,
     return data.get("items", [])
 
 
+def pod_metrics(context: str = "") -> dict:
+    """Live pod metrics (metrics-server). {} if metrics API is unavailable."""
+    try:
+        return _get_json(["get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"],
+                         context=context, timeout=30)
+    except KubectlError:
+        return {}
+
+
+def node_metrics(context: str = "") -> dict:
+    """Live node metrics (metrics-server). {} if metrics API is unavailable."""
+    try:
+        return _get_json(["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+                         context=context, timeout=30)
+    except KubectlError:
+        return {}
+
+
 def scale(ktype: str, name: str, replicas: int, *, namespace: str = "",
           context: str = "") -> str:
     args = ["scale", ktype, name, f"--replicas={replicas}"]
