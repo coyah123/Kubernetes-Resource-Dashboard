@@ -67,10 +67,12 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
 - **Nodes** — requested % vs used % per node; open a node for its details, events,
   and the pods running on it
 - **Deployments** — filter by namespace; per-pod and total (×replicas) reserved
-  footprint; open a deployment for its YAML, events, and the pods it manages
+  footprint; open a deployment for its YAML, events, and the pods it manages;
+  **tick ☑ rows to bulk rollout-restart or delete**
 - **Pods** — filter; open a pod for describe / YAML / events / **live logs** /
-  embedded **shell** (see *Inspecting & acting on resources* below)
-- **Pods by namespace** — pick a namespace, browse its pods, open any one
+  embedded **shell**; **tick ☑ rows to bulk delete** (see below)
+- **Pods by namespace** — pick a namespace, browse its pods, open any one, or
+  **tick ☑ to bulk delete**
 - **Workloads / Networking / Config / Storage** — browse (almost) every resource
   type live, grouped like the official k8s Dashboard's sidebar; open any item for
   its details, and run a few **safe, confirmed actions** (scale / rollout restart /
@@ -86,6 +88,11 @@ Rows across the app share one interaction model:
   **← Back** button to return to the list.
 - **Single-click the leading ⧉ column** → open the same detail in a **separate
   window** instead.
+- On the Pods and Deployments tabs, a leading **☑ column** lets you check several
+  rows; the buttons below the table then act on **all checked rows** (or the
+  single selected row if none are checked), each behind a confirmation:
+  - **Pods** → **Delete** (managed pods get recreated by their controller)
+  - **Deployments** → **Rollout restart** and **Delete**
 
 A resource's detail view has tabs for **Describe**, **YAML**, and **Events**.
 Pods additionally get **Logs (live)** — a real-time `kubectl logs -f` stream with
@@ -127,11 +134,11 @@ context selected at the top and needs metrics-server for the usage lines.
 **Reading the colors** — a **dark-red row** flags something actually wrong at a
 glance (missing resource limits alone is *not* reddened — it's common and rarely
 urgent):
-- **Nodes** — the node is **over 85% requested** on CPU *or* memory. The
-  scheduler sees it as nearly full and can't place many more pods there (even if
-  actual usage is low) — these are the nodes at risk of forcing a new node to
-  spin up.
-- **Pods by namespace** — the pod is **not Running/Succeeded**, or has **restarts**.
+- **Nodes** — the node is **over 85% requested** on CPU *or* memory (scheduler
+  sees it as nearly full), or **NotReady**. The **⚠ why** column spells out which.
+- **Pods** and **Pods by namespace** — the pod is unhealthy (not
+  Running/Succeeded, a container reason like `CrashLoopBackOff`/`ImagePullBackOff`,
+  or restarts). The **⚠ why** column gives the exact reason for every red row.
 
 Missing requests/limits are still surfaced, just not in red: the **Deployments**
 tab lists the exact gaps in its **"missing"** column (e.g. `web:cpu-lim`), the

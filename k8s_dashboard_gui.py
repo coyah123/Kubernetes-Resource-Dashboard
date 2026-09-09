@@ -195,6 +195,26 @@ def build_model_from_raw(raw: dict) -> dict:
         restarts = sum(cs.get("restartCount", 0) for cs in cstatuses)
         age = age_from(p["metadata"].get("creationTimestamp"))
         pod_ip = status.get("podIP", "—")
+        # Human-readable reason a pod is unhealthy: waiting/terminated container
+        # reasons (CrashLoopBackOff, ImagePullBackOff, …), a non-Running phase,
+        # and a restart count. Empty string == healthy (no red flag).
+        reasons = []
+        for cs in cstatuses:
+            cstate = cs.get("state", {})
+            w, t = cstate.get("waiting"), cstate.get("terminated")
+            if w and w.get("reason"):
+                reasons.append(w["reason"])
+            elif t and t.get("reason") and t.get("exitCode"):
+                reasons.append(t["reason"])
+        note_parts = []
+        if phase not in ("Running", "Succeeded"):
+            note_parts.append(phase)
+        for r in dict.fromkeys(reasons):
+            if r not in note_parts:
+                note_parts.append(r)
+        if restarts:
+            note_parts.append(f"{restarts} restart" + ("s" if restarts != 1 else ""))
+        status_note = ", ".join(note_parts)
         refs = p["metadata"].get("ownerReferences", [])
         owner = next((f'{o["kind"]}/{o["name"]}' for o in refs), "-")
         # Attribute this pod's usage to a Deployment (via its ReplicaSet owner).
@@ -216,6 +236,7 @@ def build_model_from_raw(raw: dict) -> dict:
         pod_rows.append({
             "namespace": ns, "pod": name, "node": node, "phase": phase, "owner": owner,
             "ready": ready_str, "restarts": restarts, "age": age, "pod_ip": pod_ip,
+            "status_note": status_note,
             "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
             "cpu_used_m": u[0], "mem_used_b": u[1], "missing_limits": missing,
         })
@@ -470,6 +491,42 @@ class Dashboard(tk.Tk):
             tree.move(k, "", i)
         tree.heading(col, command=lambda: self._sort(tree, col, not desc))
 
+    def _run_bulk(self, items, action_fn, verb, status_lbl, tree=None,
+                  remove_on_success=False):
+        """
+        Apply action_fn(ktype, name, namespace) to each (iid, ktype, name, ns) in
+        items on a background thread, then report on the UI thread. On success,
+        optionally drop the affected rows from `tree` (the in-memory model is a
+        snapshot; a full cluster refresh reconciles the rest).
+        """
+        status_lbl.config(text=f"⏳ {verb} {len(items)}…")
+        results = {"ok": [], "err": []}
+
+        def work():
+            for iid, kt, name, ns in items:
+                try:
+                    action_fn(kt, name, ns)
+                    results["ok"].append(iid)
+                except Exception as e:  # noqa: BLE001
+                    results["err"].append((name, e))
+            self.after(0, finish)
+
+        def finish():
+            if remove_on_success and tree is not None:
+                for iid in results["ok"]:
+                    if tree.exists(iid):
+                        tree.delete(iid)
+            msg = f"{verb}: {len(results['ok'])} ok"
+            if results["err"]:
+                msg += f", {len(results['err'])} failed"
+                messagebox.showerror(
+                    "Some actions failed",
+                    "\n".join(f"{n}: {e}" for n, e in results["err"]))
+            msg += "  ·  refresh from cluster to fully update"
+            status_lbl.config(text=msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
     # -- tabs --------------------------------------------------------------
     def _build_overview_tab(self):
         frame = ttk.Frame(self.nb)
@@ -573,26 +630,36 @@ class Dashboard(tk.Tk):
             a["mem"] += p["mem_req_b"]
 
         cols = ("open", "node", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
-                "mem alloc", "mem req%", "mem used%")
-        tree = self._make_tree(list_frame, cols, [40, 150, 70, 55, 90, 80, 80, 90, 80, 80])
+                "mem alloc", "mem req%", "mem used%", "⚠ why")
+        tree = self._make_tree(list_frame, cols,
+                               [40, 150, 70, 55, 90, 80, 80, 90, 80, 80, 200])
         tree.heading("open", text="⧉")
         tree.column("open", anchor="center", stretch=False)
         for n in self.model["nodes"]:
             a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
             req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
             req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
-            tag = "warn" if req_cpu_p > 85 or req_mem_p > 85 else ""
+            why = []
+            if req_cpu_p > 85:
+                why.append(f"CPU {req_cpu_p:.0f}% requested")
+            if req_mem_p > 85:
+                why.append(f"mem {req_mem_p:.0f}% requested")
+            if n["ready"] != "True":
+                why.append(f"NotReady ({n['ready']})")
+            tag = "warn" if why else ""
             tree.insert("", "end", tags=(tag,), values=(
                 "⧉", n["node"], n["ready"], a["pods"],
                 fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
                 pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
                 fmt_mem(n["mem_alloc_b"]), f"{req_mem_p:.0f}%",
                 pct(n["mem_used_b"], n["mem_alloc_b"]) if n["mem_used_b"] is not None else "—",
+                "; ".join(why),
             ))
 
         ttk.Label(list_frame, text="Double-click a node for its details, events, and the "
-                  "pods running on it — click ⧉ to open in a new window. "
-                  "req% = scheduler's view, used% = real usage.", padding=4).pack(anchor="w")
+                  "pods running on it — click ⧉ to open in a new window. Red = over 85% "
+                  "requested (scheduler sees it as nearly full) or NotReady; see the "
+                  "“⚠ why” column.", padding=4).pack(anchor="w")
 
         ctx = lambda: self.context_var.get().strip()
         wire_row_actions(
@@ -619,14 +686,18 @@ class Dashboard(tk.Tk):
         count_lbl = ttk.Label(bar, text="")
         count_lbl.pack(side="left", padx=8)
 
-        cols = ("open", "namespace", "deployment", "replicas", "cpu req/pod", "cpu lim/pod",
-                "mem req/pod", "mem lim/pod", "cpu req TOTAL", "mem req TOTAL", "missing")
+        cols = ("sel", "open", "namespace", "deployment", "replicas", "cpu req/pod",
+                "cpu lim/pod", "mem req/pod", "mem lim/pod", "cpu req TOTAL",
+                "mem req TOTAL", "missing")
         tree = self._make_tree(list_frame, cols,
-                               [40, 110, 200, 80, 90, 90, 90, 90, 95, 95, 160])
+                               [34, 40, 110, 200, 80, 90, 90, 90, 90, 95, 95, 160])
+        tree.heading("sel", text="☑")
         tree.heading("open", text="⧉")
+        tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
 
         def refill(*_):
+            ms.reset()
             for r in tree.get_children(""):
                 tree.delete(r)
             ns = ns_var.get()
@@ -635,29 +706,66 @@ class Dashboard(tk.Tk):
             rows.sort(key=lambda x: x["mem_req_total_b"], reverse=True)
             for d in rows:
                 tree.insert("", "end", values=(
-                    "⧉", d["namespace"], d["deployment"], f'{d["replicas"]} ({d["ready"]} ready)',
+                    "☐", "⧉", d["namespace"], d["deployment"],
+                    f'{d["replicas"]} ({d["ready"]} ready)',
                     fmt_cpu(d["cpu_req_m"]), fmt_cpu(d["cpu_lim_m"]) if d["cpu_lim_m"] else "none",
                     fmt_mem(d["mem_req_b"]), fmt_mem(d["mem_lim_b"]) if d["mem_lim_b"] else "none",
                     fmt_cpu(d["cpu_req_total_m"]), fmt_mem(d["mem_req_total_b"]), d["missing"],
                 ))
             count_lbl.config(text=f"{len(rows)} deployments")
 
-        ns_box.bind("<<ComboboxSelected>>", refill)
-        refill()
-
-        ttk.Label(list_frame, text="Double-click a deployment for its YAML, events, and the "
-                  "pods it manages — click ⧉ to open in a new window. "
-                  "TOTAL = per-pod × replicas (real reserved footprint).",
-                  padding=4).pack(anchor="w")
-
         ctx = lambda: self.context_var.get().strip()
-        wire_row_actions(
+        ms = MultiSelect(
             tree,
             lambda row: ResourceDetailWindow(self, "deployments", tree.set(row, "deployment"),
                                              tree.set(row, "namespace"), ctx()),
             lambda sel: open_inline_detail(frame, list_frame, "deployments",
                                            tree.set(sel, "deployment"),
                                            tree.set(sel, "namespace"), ctx()))
+        ns_box.bind("<<ComboboxSelected>>", refill)
+        refill()
+
+        # -- bulk actions --
+        act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
+        act.pack(fill="x")
+        act_status = ttk.Label(act, text="")
+
+        def targets():
+            return [(i, "deployments", tree.set(i, "deployment"), tree.set(i, "namespace"))
+                    for i in ms.targets()]
+
+        def do_restart():
+            items = targets()
+            if not items:
+                messagebox.showinfo("Nothing selected", "Check rows, or select one.")
+                return
+            if not messagebox.askyesno(
+                    "Rollout restart", f"Rolling-restart {len(items)} deployment(s)?"):
+                return
+            self._run_bulk(items, lambda kt, n, ns: kubectl_collect.rollout_restart(
+                kt, n, namespace=ns, context=ctx()), "Restarted", act_status)
+
+        def do_delete():
+            items = targets()
+            if not items:
+                messagebox.showinfo("Nothing selected", "Check rows, or select one.")
+                return
+            names = ", ".join(n for _, _, n, _ in items[:5]) + ("…" if len(items) > 5 else "")
+            if not messagebox.askyesno(
+                    "Delete", f"Delete {len(items)} deployment(s)?\n\n{names}\n\n"
+                    "This cannot be undone.", icon="warning"):
+                return
+            self._run_bulk(items, lambda kt, n, ns: kubectl_collect.delete(
+                kt, n, namespace=ns, context=ctx()), "Deleted", act_status,
+                tree=tree, remove_on_success=True)
+
+        ttk.Button(act, text="Rollout restart", command=do_restart).pack(side="left")
+        ttk.Button(act, text="Delete…", command=do_delete).pack(side="left", padx=4)
+        act_status.pack(side="left", padx=8)
+
+        ttk.Label(list_frame, text="Tick ☑ to select multiple (or just click a row), then "
+                  "use the buttons. Double-click a deployment for its YAML, events, and pods; "
+                  "click ⧉ for a new window.", padding=4).pack(anchor="w")
 
     def _build_pods_tab(self):
         frame = ttk.Frame(self.nb)
@@ -670,15 +778,17 @@ class Dashboard(tk.Tk):
         ttk.Label(bar, text="Filter:").pack(side="left")
         filt = tk.StringVar()
         ttk.Entry(bar, textvariable=filt, width=40).pack(side="left", padx=4)
-        ttk.Label(bar, text="Double-click a pod for details / logs / shell — "
-                  "click ⧉ to open in a new window.").pack(side="left", padx=10)
-        cols = ("open", "namespace", "pod", "node", "phase", "cpu req", "cpu used",
-                "mem req", "mem used", "no lim")
-        tree = self._make_tree(list_frame, cols, [40, 110, 240, 150, 70, 80, 80, 80, 80, 55])
+        cols = ("sel", "open", "namespace", "pod", "node", "phase", "cpu req", "cpu used",
+                "mem req", "mem used", "no lim", "⚠ why")
+        tree = self._make_tree(list_frame, cols,
+                               [34, 40, 110, 240, 150, 70, 80, 80, 80, 80, 55, 200])
+        tree.heading("sel", text="☑")
         tree.heading("open", text="⧉")
+        tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
 
         def refill(*_):
+            ms.reset()
             for r in tree.get_children(""):
                 tree.delete(r)
             q = filt.get().lower()
@@ -687,23 +797,50 @@ class Dashboard(tk.Tk):
                 hay = f'{p["namespace"]} {p["pod"]} {p["node"]}'.lower()
                 if q and q not in hay:
                     continue
-                tree.insert("", "end", values=(
-                    "⧉", p["namespace"], p["pod"], p["node"], p["phase"],
+                tree.insert("", "end", tags=("warn" if p["status_note"] else "",), values=(
+                    "☐", "⧉", p["namespace"], p["pod"], p["node"], p["phase"],
                     fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
                     fmt_mem(p["mem_req_b"]), fmt_mem(p["mem_used_b"]),
-                    "⚠" if p["missing_limits"] else "",
+                    "⚠" if p["missing_limits"] else "", p["status_note"],
                 ))
-        filt.trace_add("write", refill)
-        refill()
-
         ctx = lambda: self.context_var.get().strip()
-        wire_row_actions(
+        ms = MultiSelect(
             tree,
             lambda row: ResourceDetailWindow(self, "pod", tree.set(row, "pod"),
                                              tree.set(row, "namespace"), ctx()),
             lambda sel: open_inline_detail(frame, list_frame, "pod",
                                            tree.set(sel, "pod"),
                                            tree.set(sel, "namespace"), ctx()))
+        filt.trace_add("write", refill)
+        refill()
+
+        act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
+        act.pack(fill="x")
+        act_status = ttk.Label(act, text="")
+
+        def do_delete():
+            items = [(i, "pod", tree.set(i, "pod"), tree.set(i, "namespace"))
+                     for i in ms.targets()]
+            if not items:
+                messagebox.showinfo("Nothing selected", "Check rows, or select one.")
+                return
+            names = ", ".join(n for _, _, n, _ in items[:5]) + ("…" if len(items) > 5 else "")
+            if not messagebox.askyesno(
+                    "Delete", f"Delete {len(items)} pod(s)?\n\n{names}\n\n"
+                    "Managed pods will be recreated by their controller.",
+                    icon="warning"):
+                return
+            self._run_bulk(items, lambda kt, n, ns: kubectl_collect.delete(
+                kt, n, namespace=ns, context=ctx()), "Deleted", act_status,
+                tree=tree, remove_on_success=True)
+
+        ttk.Button(act, text="Delete…", command=do_delete).pack(side="left")
+        act_status.pack(side="left", padx=8)
+
+        ttk.Label(list_frame, text="Tick ☑ to select multiple (or just click a row), then "
+                  "Delete. Double-click a pod for details / logs / shell; click ⧉ for a "
+                  "new window. Red row = unhealthy; the “⚠ why” column says why.",
+                  padding=4).pack(anchor="w")
 
     def _build_pods_by_ns_tab(self):
         frame = ttk.Frame(self.nb)
@@ -729,39 +866,67 @@ class Dashboard(tk.Tk):
         count_lbl = ttk.Label(bar, text="")
         count_lbl.pack(side="left", padx=8)
 
-        # Leading "open" column carries a ⧉ icon: single-click it to pop the pod
-        # out into its own window instead of navigating in-place.
-        cols = ("open", "pod", "ready", "phase", "restarts", "age", "node", "pod ip")
+        # Leading "sel" (☐/☑) + "open" (⧉) columns drive multi-select and the
+        # single-click new-window shortcut.
+        cols = ("sel", "open", "pod", "ready", "phase", "restarts", "age",
+                "node", "pod ip", "⚠ why")
         tree = self._make_tree(parent, cols,
-                               [44, 280, 60, 100, 70, 70, 160, 120])
+                               [34, 44, 260, 60, 90, 70, 70, 150, 120, 200])
+        tree.heading("sel", text="☑")
         tree.heading("open", text="⧉")
+        tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
 
         def refill(*_):
+            ms.reset()
             for r in tree.get_children(""):
                 tree.delete(r)
             ns = ns_var.get()
             rows = sorted((p for p in self.model["pods"] if p["namespace"] == ns),
                           key=lambda p: p["pod"])
             for p in rows:
-                bad = p["phase"] not in ("Running", "Succeeded") or p["restarts"] > 0
-                tree.insert("", "end", tags=("warn" if bad else "",), values=(
-                    "⧉", p["pod"], p["ready"], p["phase"], p["restarts"],
-                    p["age"], p["node"], p["pod_ip"],
+                tree.insert("", "end", tags=("warn" if p["status_note"] else "",), values=(
+                    "☐", "⧉", p["pod"], p["ready"], p["phase"], p["restarts"],
+                    p["age"], p["node"], p["pod_ip"], p["status_note"],
                 ))
             count_lbl.config(text=f"{len(rows)} pods")
 
-        ns_box.bind("<<ComboboxSelected>>", refill)
-        refill()
-
-        ttk.Label(parent, padding=4, text=(
-            "Double-click a pod to open it here (describe / get / logs / shell). "
-            "Click ⧉ to open it in a separate window instead.")).pack(anchor="w")
-
-        wire_row_actions(
+        ms = MultiSelect(
             tree,
             lambda row: self._open_pod_window(tree.set(row, "pod"), ns_var.get()),
             lambda sel: self._open_pod_inplace(tree.set(sel, "pod"), ns_var.get()))
+        ns_box.bind("<<ComboboxSelected>>", refill)
+        refill()
+
+        act = ttk.Frame(parent, padding=(4, 0, 4, 4))
+        act.pack(fill="x")
+        act_status = ttk.Label(act, text="")
+        ctx = lambda: self.context_var.get().strip()
+
+        def do_delete():
+            ns = ns_var.get()
+            items = [(i, "pod", tree.set(i, "pod"), ns) for i in ms.targets()]
+            if not items:
+                messagebox.showinfo("Nothing selected", "Check rows, or select one.")
+                return
+            names = ", ".join(n for _, _, n, _ in items[:5]) + ("…" if len(items) > 5 else "")
+            if not messagebox.askyesno(
+                    "Delete", f"Delete {len(items)} pod(s) in {ns}?\n\n{names}\n\n"
+                    "Managed pods will be recreated by their controller.",
+                    icon="warning"):
+                return
+            self._run_bulk(items, lambda kt, n, nns: kubectl_collect.delete(
+                kt, n, namespace=nns, context=ctx()), "Deleted", act_status,
+                tree=tree, remove_on_success=True)
+
+        ttk.Button(act, text="Delete…", command=do_delete).pack(side="left")
+        act_status.pack(side="left", padx=8)
+
+        ttk.Label(parent, padding=4, text=(
+            "Tick ☑ to select multiple (or just click a row), then Delete. "
+            "Double-click a pod to open it here (describe / logs / shell); click ⧉ for a "
+            "separate window. Red row = unhealthy; the “⚠ why” column says why.")
+            ).pack(anchor="w")
 
     def _open_pod_window(self, pod, namespace):
         ResourceDetailWindow(self, "pod", pod, namespace,
@@ -1443,6 +1608,59 @@ def wire_row_actions(tree, on_open_window, on_open_inplace):
 
     tree.bind("<Button-1>", on_click)
     tree.bind("<Double-1>", on_double)
+
+
+class MultiSelect:
+    """
+    Adds checkbox behavior to a Treeview whose first column is "sel" (☐/☑) and
+    second column is "open" (⧉). Single-click toggles the checkbox; ⧉ opens a new
+    window; double-click elsewhere navigates in-place. targets() returns the
+    checked rows, or the focused row if nothing is checked.
+    """
+
+    def __init__(self, tree, on_open_window, on_open_inplace):
+        self.tree = tree
+        self.checked = set()
+        self._on_window = on_open_window
+        self._on_inplace = on_open_inplace
+        tree.bind("<Button-1>", self._on_click)
+        tree.bind("<Double-1>", self._on_double)
+
+    def _toggle(self, row):
+        if row in self.checked:
+            self.checked.discard(row)
+            self.tree.set(row, "sel", "☐")
+        else:
+            self.checked.add(row)
+            self.tree.set(row, "sel", "☑")
+
+    def _on_click(self, e):
+        if self.tree.identify_region(e.x, e.y) != "cell":
+            return
+        col = self.tree.identify_column(e.x)
+        row = self.tree.identify_row(e.y)
+        if not row:
+            return
+        if col == "#1":
+            self._toggle(row)
+        elif col == "#2":
+            self._on_window(row)
+
+    def _on_double(self, e):
+        if self.tree.identify_column(e.x) in ("#1", "#2"):
+            return
+        sel = self.tree.focus()
+        if sel:
+            self._on_inplace(sel)
+
+    def reset(self):
+        self.checked.clear()
+
+    def targets(self):
+        if self.checked:
+            return [i for i in self.checked if self.tree.exists(i)]
+        f = self.tree.focus()
+        return [f] if f else []
 
 
 def open_inline_detail(host, list_frame, kind, name, namespace, context):
