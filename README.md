@@ -62,11 +62,50 @@ That's it. The app starts empty and only shows data after you refresh (or click
 folder" to cache a snapshot you can reopen later (offline / air-gapped).
 
 **Tabs:**
-- **Nodes** — requested % vs used % per node; double-click a node to see its pods
-- **Deployments** — per-pod and total (×replicas) reserved footprint
-- **Pods** — filter by namespace/node
-- **Biggest offenders** — pods reserving far more memory than they actually use
+- **🏠 Overview** — cluster summary: node/deploy/pod counts, capacity (allocatable
+  vs requested vs used) for CPU and memory, and the biggest memory offenders
+- **Nodes** — requested % vs used % per node; open a node for its details, events,
+  and the pods running on it
+- **Deployments** — filter by namespace; per-pod and total (×replicas) reserved
+  footprint; open a deployment for its YAML, events, and the pods it manages
+- **Pods** — filter; open a pod for describe / YAML / events / **live logs** /
+  embedded **shell** (see *Inspecting & acting on resources* below)
+- **Pods by namespace** — pick a namespace, browse its pods, open any one
+- **Workloads / Networking / Config / Storage** — browse (almost) every resource
+  type live, grouped like the official k8s Dashboard's sidebar; open any item for
+  its details, and run a few **safe, confirmed actions** (scale / rollout restart /
+  delete)
+- **Resource Management** — pods reserving far more memory than they actually use
 - **Trends** — record resource use over time and graph it (see below)
+
+### Inspecting & acting on resources
+
+Rows across the app share one interaction model:
+
+- **Double-click** a row → its detail opens **in-place** in the same tab, with a
+  **← Back** button to return to the list.
+- **Single-click the leading ⧉ column** → open the same detail in a **separate
+  window** instead.
+
+A resource's detail view has tabs for **Describe**, **YAML**, and **Events**.
+Pods additionally get **Logs (live)** — a real-time `kubectl logs -f` stream with
+pause / restart / clear / auto-scroll — and two embedded terminals, **Shell: sh**
+and **Shell: bash**, via `kubectl exec -i`. Controllers (Deployments, StatefulSets,
+DaemonSets, ReplicaSets, Jobs) and Nodes also get a **Pods** tab listing what they
+run, itself clickable.
+
+> The embedded shells are line-oriented (no TTY): `ls`, `cat`, `env` work fine, but
+> full-screen programs (`vim`, `top`) and shell prompts won't render. Use `ls -C`
+> for columns. Bash is unavailable in minimal images (e.g. Alpine) — use **sh**.
+
+**Safe actions** on the grouped tabs — every mutating action asks for confirmation
+first, then reloads the list:
+- **Scale…** (Deployments / StatefulSets / ReplicaSets) — prompts for a replica count
+- **Rollout restart** (Deployments / StatefulSets / DaemonSets)
+- **Delete…** — with a warning prompt
+
+There is no create/edit-and-apply or deploy wizard — this stays a read-mostly tool
+with a few common, guarded actions.
 
 ### Trends tab (capture over a day)
 
@@ -85,19 +124,19 @@ Samples are appended to `data/trends-history.jsonl` (gitignored), so history
 survives restarts and reloads when you reopen the app. Capture uses the same
 context selected at the top and needs metrics-server for the usage lines.
 
-**Reading the colors** — a **dark-red row** is a warning flag. What it means
-depends on the tab:
+**Reading the colors** — a **dark-red row** flags something actually wrong at a
+glance (missing resource limits alone is *not* reddened — it's common and rarely
+urgent):
 - **Nodes** — the node is **over 85% requested** on CPU *or* memory. The
   scheduler sees it as nearly full and can't place many more pods there (even if
   actual usage is low) — these are the nodes at risk of forcing a new node to
   spin up.
-- **Deployments** — the deployment is **missing at least one request or limit**.
-  The exact gaps are listed in the **"missing"** column (e.g. `web:cpu-lim`).
-- **Pods** (and the per-node pod popup) — the pod has **at least one container
-  with no CPU or memory limit**. The Pods tab also marks these with ⚠ in the
-  "no lim" column.
+- **Pods by namespace** — the pod is **not Running/Succeeded**, or has **restarts**.
 
-The **Biggest offenders** tab has no red highlight — it's already sorted
+Missing requests/limits are still surfaced, just not in red: the **Deployments**
+tab lists the exact gaps in its **"missing"** column (e.g. `web:cpu-lim`), the
+**Pods** tab marks them with ⚠ in the "no lim" column, and the **Overview** shows
+counts. The **Resource Management** tab has no red highlight — it's already sorted
 worst-first by wasted (requested − used) memory, so every row is an offender.
 
 **Custom kubectl command (optional)** — by default the app runs plain `kubectl`
@@ -119,6 +158,32 @@ KUBECTL="kubectl.custom" python3 k8s_dashboard_gui.py
 reads cached JSON from `./data` (`pip install -r requirements.txt; streamlit run
 app.py`). The collector scripts `collect.sh` / `collect.ps1` still exist for
 machines where you'd rather dump JSON separately.
+
+### Air-gapped dependency bundle (`Airgapped_Prep.py`)
+
+The **desktop app needs no dependencies** — only Python-with-tkinter. This helper
+is for the optional Streamlit web app: run it on a machine **with** internet to
+download every wheel in `requirements.txt` (and its transitive deps) for Windows,
+macOS, and Linux, each into its own folder, so you can install with **no network**
+on an air-gapped box.
+
+```bash
+python Airgapped_Prep.py                 # -> ./airgapped_bundle/{windows,macos,linux}/
+python Airgapped_Prep.py --include-arm   # also Linux aarch64 + more macOS arm64
+```
+
+The OS you run it on doesn't matter — `pip download --platform` cross-fetches wheels
+for all targets. Each OS folder gets the `.whl` files, a copy of `requirements.txt`,
+and an **`INSTALL.txt`** with the exact offline command (there's also a combined
+`INSTALL_COMMANDS.txt` at the top). On the offline machine, copy the matching OS
+folder over and run its one command:
+
+```bash
+python -m pip install --no-index --find-links . -r requirements.txt
+```
+
+Options: `--python-versions 3.11 3.12 3.13` (which interpreter versions to fetch
+for), `--os windows macos linux` (subset), `--requirements PATH`, `--output DIR`.
 
 ## Kubernetes commands used
 

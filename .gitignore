@@ -4,3 +4,6 @@ data/
 # Python
 __pycache__/
 *.py[cod]
+
+# Air-gapped dependency bundle produced by Airgapped_Prep.py (large; regenerable)
+airgapped_bundle/

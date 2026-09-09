@@ -74,6 +74,111 @@ def _run(args: list[str], *, context: str = "", timeout: int = 60) -> str:
     return proc.stdout
 
 
+def run_text(args: list[str], *, context: str = "", timeout: int = 60) -> str:
+    """Run `kubectl <args>` and return its raw text output (describe/get/etc.)."""
+    return _run(args, context=context, timeout=timeout)
+
+
+def list_namespaces(context: str = "") -> list[str]:
+    """Every namespace name in the cluster (sorted). [] if the call fails."""
+    try:
+        out = _run(["get", "ns", "-o", "name"], context=context)
+    except KubectlError:
+        return []
+    names = [ln.split("/", 1)[-1].strip() for ln in out.splitlines() if ln.strip()]
+    return sorted(names)
+
+
+def popen_logs(namespace: str, pod: str, *, context: str = "",
+               tail: int = 200, follow: bool = True) -> subprocess.Popen:
+    """
+    Start `kubectl logs [-f]` for a pod and return the running Popen.
+
+    stdout+stderr are merged and line-buffered so a reader thread can stream them
+    into the UI. --all-containers/--prefix keeps multi-container pods readable.
+    The caller owns the process and must terminate() it when done.
+    """
+    cmd = _base_cmd()
+    if context:
+        cmd += ["--context", context]
+    cmd += ["logs", pod, "-n", namespace,
+            "--all-containers=true", "--prefix=true", f"--tail={tail}"]
+    if follow:
+        cmd.append("-f")
+    if shutil.which(cmd[0]) is None:
+        raise KubectlError(f"'{cmd[0]}' was not found on your PATH.")
+    return subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, creationflags=_NO_WINDOW,
+    )
+
+
+def popen_exec(namespace: str, pod: str, shell: str = "sh", *,
+               context: str = "") -> subprocess.Popen:
+    """
+    Start `kubectl exec -i <pod> -- <shell>` for an embedded terminal.
+
+    Uses -i (no -t): there's no real TTY, so this is a line-oriented pipe shell —
+    great for ls/cat/env, but full-screen programs (vim, top) won't render. stdin
+    is a pipe the caller writes commands to; stdout+stderr are merged for a reader
+    thread. The caller owns the process and must terminate() it when done.
+    """
+    cmd = _base_cmd()
+    if context:
+        cmd += ["--context", context]
+    cmd += ["exec", "-i", pod, "-n", namespace, "--", shell]
+    if shutil.which(cmd[0]) is None:
+        raise KubectlError(f"'{cmd[0]}' was not found on your PATH.")
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, creationflags=_NO_WINDOW,
+    )
+    # On Windows, text-mode writes translate "\n" -> "\r\n", so the remote shell
+    # sees a stray CR ("ls\r": command not found). Disable newline translation on
+    # stdin so exactly what we write reaches the shell.
+    try:
+        proc.stdin.reconfigure(newline="")
+    except (AttributeError, ValueError):
+        pass
+    return proc
+
+
+def list_items(ktype: str, *, namespace: str = "", all_namespaces: bool = False,
+               context: str = "", timeout: int = 30) -> list[dict]:
+    """`kubectl get <ktype> [-A|-n ns] -o json` -> the .items list."""
+    args = ["get", ktype]
+    if all_namespaces:
+        args.append("-A")
+    elif namespace:
+        args += ["-n", namespace]
+    args += ["-o", "json"]
+    data = json.loads(_run(args, context=context, timeout=timeout))
+    return data.get("items", [])
+
+
+def scale(ktype: str, name: str, replicas: int, *, namespace: str = "",
+          context: str = "") -> str:
+    args = ["scale", ktype, name, f"--replicas={replicas}"]
+    if namespace:
+        args += ["-n", namespace]
+    return _run(args, context=context)
+
+
+def rollout_restart(ktype: str, name: str, *, namespace: str = "",
+                    context: str = "") -> str:
+    args = ["rollout", "restart", f"{ktype}/{name}"]
+    if namespace:
+        args += ["-n", namespace]
+    return _run(args, context=context)
+
+
+def delete(ktype: str, name: str, *, namespace: str = "", context: str = "") -> str:
+    args = ["delete", ktype, name]
+    if namespace:
+        args += ["-n", namespace]
+    return _run(args, context=context)
+
+
 def list_contexts() -> tuple[list[str], str]:
     """Return (all context names, current context). Empty/[] if none configured."""
     try:

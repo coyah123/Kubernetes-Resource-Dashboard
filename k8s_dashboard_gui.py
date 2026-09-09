@@ -23,8 +23,9 @@ import sys
 import threading
 import time
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import kubectl_collect
 import trends
@@ -82,6 +83,29 @@ def fmt_mem(b):
 
 def pct(n, d):
     return f"{n/d*100:.0f}%" if d else "—"
+
+
+def age_from(ts):
+    """Kubernetes creationTimestamp (ISO8601 Z) -> compact age like '3d4h', '12m'."""
+    if not ts:
+        return "—"
+    try:
+        t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return "—"
+    secs = int((datetime.now(timezone.utc) - t).total_seconds())
+    if secs < 0:
+        secs = 0
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d{h}h" if h else f"{d}d"
+    if h:
+        return f"{h}h{m}m" if m else f"{h}h"
+    if m:
+        return f"{m}m"
+    return f"{secs}s"
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +185,16 @@ def build_model_from_raw(raw: dict) -> dict:
     for p in pods.get("items", []):
         ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
         spec = p.get("spec", {})
+        status = p.get("status", {})
         node = spec.get("nodeName", "<unscheduled>")
-        phase = p.get("status", {}).get("phase", "?")
+        phase = status.get("phase", "?")
+        cstatuses = status.get("containerStatuses", [])
+        n_ready = sum(1 for cs in cstatuses if cs.get("ready"))
+        n_total = len(spec.get("containers", []))
+        ready_str = f"{n_ready}/{n_total}"
+        restarts = sum(cs.get("restartCount", 0) for cs in cstatuses)
+        age = age_from(p["metadata"].get("creationTimestamp"))
+        pod_ip = status.get("podIP", "—")
         refs = p["metadata"].get("ownerReferences", [])
         owner = next((f'{o["kind"]}/{o["name"]}' for o in refs), "-")
         # Attribute this pod's usage to a Deployment (via its ReplicaSet owner).
@@ -183,6 +215,7 @@ def build_model_from_raw(raw: dict) -> dict:
         u = pod_usage.get((ns, name), (None, None))
         pod_rows.append({
             "namespace": ns, "pod": name, "node": node, "phase": phase, "owner": owner,
+            "ready": ready_str, "restarts": restarts, "age": age, "pod_ip": pod_ip,
             "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
             "cpu_used_m": u[0], "mem_used_b": u[1], "missing_limits": missing,
         })
@@ -392,13 +425,20 @@ class Dashboard(tk.Tk):
             self.nb.forget(f)
             f.destroy()
         self._analysis_frames = []
+        self._build_overview_tab()
         self._build_nodes_tab()
         self._build_deploys_tab()
         self._build_pods_tab()
+        self._build_pods_by_ns_tab()
         self._build_offenders_tab()
+        for group in RESOURCE_GROUPS:
+            self._build_group_tab(group)
         # Keep Trends as the last tab.
         self.nb.insert("end", self._trends_frame)
         self._trends_refresh_namespaces()
+        # Always land on Overview after a (re)build, not the persistent Trends tab.
+        if self._analysis_frames:
+            self.nb.select(self._analysis_frames[0])
 
     # -- helpers -----------------------------------------------------------
     def _make_tree(self, parent, columns, widths=None):
@@ -431,10 +471,98 @@ class Dashboard(tk.Tk):
         tree.heading(col, command=lambda: self._sort(tree, col, not desc))
 
     # -- tabs --------------------------------------------------------------
+    def _build_overview_tab(self):
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="🏠 Overview")
+        self._analysis_frames.append(frame)
+
+        pods = self.model["pods"]
+        nodes = self.model["nodes"]
+        deps = self.model["deployments"]
+        has_metrics = any(p["cpu_used_m"] is not None for p in pods)
+
+        if not pods and not nodes:
+            ttk.Label(frame, padding=20, font=("", 11), text=(
+                "No data yet.\n\nPick a context above and hit “⟳ Refresh from cluster”, "
+                "or “Load files” for a cached snapshot.")).pack(anchor="w")
+            return
+
+        # cluster-wide roll-ups
+        cpu_alloc = sum(n["cpu_alloc_m"] for n in nodes)
+        mem_alloc = sum(n["mem_alloc_b"] for n in nodes)
+        cpu_req = sum(p["cpu_req_m"] for p in pods)
+        mem_req = sum(p["mem_req_b"] for p in pods)
+        cpu_used = sum(n["cpu_used_m"] for n in nodes if n["cpu_used_m"] is not None)
+        mem_used = sum(n["mem_used_b"] for n in nodes if n["mem_used_b"] is not None)
+        not_running = sum(1 for p in pods if p["phase"] not in ("Running", "Succeeded"))
+        restarting = sum(1 for p in pods if p["restarts"] > 0)
+        pods_no_lim = sum(1 for p in pods if p["missing_limits"])
+        deps_bad = sum(1 for d in deps if d["missing"])
+
+        # --- metric cards ---
+        cards = ttk.Frame(frame, padding=(8, 10, 8, 4))
+        cards.pack(fill="x")
+
+        def card(parent, value, label, warn=False):
+            box = ttk.Frame(parent, relief="solid", borderwidth=1, padding=(12, 8))
+            box.pack(side="left", padx=5)
+            ttk.Label(box, text=str(value), font=("", 18, "bold"),
+                      foreground=("#c0392b" if warn else "")).pack()
+            ttk.Label(box, text=label).pack()
+            return box
+
+        card(cards, len(nodes), "Nodes")
+        card(cards, len(deps), "Deployments")
+        card(cards, len(pods), "Pods")
+        card(cards, not_running, "Not running", warn=not_running > 0)
+        card(cards, restarting, "With restarts", warn=restarting > 0)
+        card(cards, pods_no_lim, "Pods w/o limits")
+        card(cards, deps_bad, "Deploys w/o req/lim")
+
+        # --- cluster capacity ---
+        cap = ttk.LabelFrame(frame, text="Cluster capacity", padding=8)
+        cap.pack(fill="x", padx=8, pady=8)
+        cap_cols = ("resource", "allocatable", "requested", "used")
+        ctree = self._make_tree(cap, cap_cols, [140, 160, 200, 200])
+        ctree.insert("", "end", values=(
+            "CPU", fmt_cpu(cpu_alloc),
+            f"{fmt_cpu(cpu_req)}  ({pct(cpu_req, cpu_alloc)})",
+            f"{fmt_cpu(cpu_used)}  ({pct(cpu_used, cpu_alloc)})" if has_metrics else "—",
+        ))
+        ctree.insert("", "end", values=(
+            "Memory", fmt_mem(mem_alloc),
+            f"{fmt_mem(mem_req)}  ({pct(mem_req, mem_alloc)})",
+            f"{fmt_mem(mem_used)}  ({pct(mem_used, mem_alloc)})" if has_metrics else "—",
+        ))
+        ttk.Label(cap, padding=(0, 4), text=(
+            "requested = what the scheduler reserves (why nodes fill up).  "
+            "used = real utilization" + ("" if has_metrics else " — no metrics-server."))
+        ).pack(anchor="w")
+
+        # --- biggest offenders preview ---
+        off = ttk.LabelFrame(frame, text="Biggest memory offenders (requested − used)",
+                             padding=8)
+        off.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        cols = ("namespace", "pod", "mem req", "mem used", "mem WASTED")
+        otree = self._make_tree(off, cols, [140, 300, 110, 110, 120])
+        rows = [p for p in pods if p["mem_used_b"] is not None]
+        rows.sort(key=lambda p: p["mem_req_b"] - (p["mem_used_b"] or 0), reverse=True)
+        for p in rows[:8]:
+            waste = p["mem_req_b"] - (p["mem_used_b"] or 0)
+            otree.insert("", "end", values=(
+                p["namespace"], p["pod"], fmt_mem(p["mem_req_b"]),
+                fmt_mem(p["mem_used_b"]), fmt_mem(waste),
+            ))
+        if not rows:
+            ttk.Label(off, text="No metrics-server data — usage-based ranking unavailable."
+                      ).pack(anchor="w")
+
     def _build_nodes_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Nodes")
         self._analysis_frames.append(frame)
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True)
 
         # aggregate pod requests per node
         agg = {}
@@ -444,77 +572,111 @@ class Dashboard(tk.Tk):
             a["cpu"] += p["cpu_req_m"]
             a["mem"] += p["mem_req_b"]
 
-        cols = ("node", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
+        cols = ("open", "node", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
                 "mem alloc", "mem req%", "mem used%")
-        tree = self._make_tree(frame, cols, [150, 70, 55, 90, 80, 80, 90, 80, 80])
+        tree = self._make_tree(list_frame, cols, [40, 150, 70, 55, 90, 80, 80, 90, 80, 80])
+        tree.heading("open", text="⧉")
+        tree.column("open", anchor="center", stretch=False)
         for n in self.model["nodes"]:
             a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
             req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
             req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
             tag = "warn" if req_cpu_p > 85 or req_mem_p > 85 else ""
             tree.insert("", "end", tags=(tag,), values=(
-                n["node"], n["ready"], a["pods"],
+                "⧉", n["node"], n["ready"], a["pods"],
                 fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
                 pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
                 fmt_mem(n["mem_alloc_b"]), f"{req_mem_p:.0f}%",
                 pct(n["mem_used_b"], n["mem_alloc_b"]) if n["mem_used_b"] is not None else "—",
             ))
 
-        ttk.Label(frame, text="Double-click a node to see the pods on it. "
-                  "req% = scheduler's view (why nodes fill), used% = real usage.",
-                  padding=4).pack(anchor="w")
-        tree.bind("<Double-1>", lambda e: self._show_node_pods(tree))
+        ttk.Label(list_frame, text="Double-click a node for its details, events, and the "
+                  "pods running on it — click ⧉ to open in a new window. "
+                  "req% = scheduler's view, used% = real usage.", padding=4).pack(anchor="w")
 
-    def _show_node_pods(self, tree):
-        sel = tree.focus()
-        if not sel:
-            return
-        node = tree.set(sel, "node")
-        win = tk.Toplevel(self)
-        win.title(f"Pods on {node}")
-        win.geometry("1000x500")
-        cols = ("namespace", "pod", "phase", "owner", "cpu req", "cpu lim",
-                "cpu used", "mem req", "mem lim", "mem used")
-        t = self._make_tree(win, cols, [110, 240, 70, 150, 80, 80, 80, 80, 80, 80])
-        rows = sorted((p for p in self.model["pods"] if p["node"] == node),
-                      key=lambda p: p["mem_req_b"], reverse=True)
-        for p in rows:
-            t.insert("", "end", tags=("warn" if p["missing_limits"] else "",), values=(
-                p["namespace"], p["pod"], p["phase"], p["owner"],
-                fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_lim_m"]) if p["cpu_lim_m"] else "—",
-                fmt_cpu(p["cpu_used_m"]), fmt_mem(p["mem_req_b"]),
-                fmt_mem(p["mem_lim_b"]) if p["mem_lim_b"] else "—", fmt_mem(p["mem_used_b"]),
-            ))
+        ctx = lambda: self.context_var.get().strip()
+        wire_row_actions(
+            tree,
+            lambda row: ResourceDetailWindow(self, "nodes", tree.set(row, "node"), "", ctx()),
+            lambda sel: open_inline_detail(frame, list_frame, "nodes",
+                                           tree.set(sel, "node"), "", ctx()))
 
     def _build_deploys_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Deployments")
         self._analysis_frames.append(frame)
-        cols = ("namespace", "deployment", "replicas", "cpu req/pod", "cpu lim/pod",
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(list_frame, padding=4)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Namespace:").pack(side="left")
+        namespaces = ["(all)"] + sorted({d["namespace"] for d in self.model["deployments"]})
+        ns_var = tk.StringVar(value="(all)")
+        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=26, state="readonly",
+                              values=namespaces)
+        ns_box.pack(side="left", padx=4)
+        count_lbl = ttk.Label(bar, text="")
+        count_lbl.pack(side="left", padx=8)
+
+        cols = ("open", "namespace", "deployment", "replicas", "cpu req/pod", "cpu lim/pod",
                 "mem req/pod", "mem lim/pod", "cpu req TOTAL", "mem req TOTAL", "missing")
-        tree = self._make_tree(frame, cols, [110, 200, 80, 90, 90, 90, 90, 95, 95, 160])
-        for d in sorted(self.model["deployments"], key=lambda x: x["mem_req_total_b"], reverse=True):
-            tree.insert("", "end", tags=("warn" if d["missing"] else "",), values=(
-                d["namespace"], d["deployment"], f'{d["replicas"]} ({d["ready"]} ready)',
-                fmt_cpu(d["cpu_req_m"]), fmt_cpu(d["cpu_lim_m"]) if d["cpu_lim_m"] else "none",
-                fmt_mem(d["mem_req_b"]), fmt_mem(d["mem_lim_b"]) if d["mem_lim_b"] else "none",
-                fmt_cpu(d["cpu_req_total_m"]), fmt_mem(d["mem_req_total_b"]), d["missing"],
-            ))
-        ttk.Label(frame, text="TOTAL = per-pod × replicas (real reserved footprint). "
-                  "Red = missing a request/limit.", padding=4).pack(anchor="w")
+        tree = self._make_tree(list_frame, cols,
+                               [40, 110, 200, 80, 90, 90, 90, 90, 95, 95, 160])
+        tree.heading("open", text="⧉")
+        tree.column("open", anchor="center", stretch=False)
+
+        def refill(*_):
+            for r in tree.get_children(""):
+                tree.delete(r)
+            ns = ns_var.get()
+            rows = [d for d in self.model["deployments"]
+                    if ns == "(all)" or d["namespace"] == ns]
+            rows.sort(key=lambda x: x["mem_req_total_b"], reverse=True)
+            for d in rows:
+                tree.insert("", "end", values=(
+                    "⧉", d["namespace"], d["deployment"], f'{d["replicas"]} ({d["ready"]} ready)',
+                    fmt_cpu(d["cpu_req_m"]), fmt_cpu(d["cpu_lim_m"]) if d["cpu_lim_m"] else "none",
+                    fmt_mem(d["mem_req_b"]), fmt_mem(d["mem_lim_b"]) if d["mem_lim_b"] else "none",
+                    fmt_cpu(d["cpu_req_total_m"]), fmt_mem(d["mem_req_total_b"]), d["missing"],
+                ))
+            count_lbl.config(text=f"{len(rows)} deployments")
+
+        ns_box.bind("<<ComboboxSelected>>", refill)
+        refill()
+
+        ttk.Label(list_frame, text="Double-click a deployment for its YAML, events, and the "
+                  "pods it manages — click ⧉ to open in a new window. "
+                  "TOTAL = per-pod × replicas (real reserved footprint).",
+                  padding=4).pack(anchor="w")
+
+        ctx = lambda: self.context_var.get().strip()
+        wire_row_actions(
+            tree,
+            lambda row: ResourceDetailWindow(self, "deployments", tree.set(row, "deployment"),
+                                             tree.set(row, "namespace"), ctx()),
+            lambda sel: open_inline_detail(frame, list_frame, "deployments",
+                                           tree.set(sel, "deployment"),
+                                           tree.set(sel, "namespace"), ctx()))
 
     def _build_pods_tab(self):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Pods")
         self._analysis_frames.append(frame)
-        bar = ttk.Frame(frame, padding=4)
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True)
+        bar = ttk.Frame(list_frame, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="Filter:").pack(side="left")
         filt = tk.StringVar()
         ttk.Entry(bar, textvariable=filt, width=40).pack(side="left", padx=4)
-        cols = ("namespace", "pod", "node", "phase", "cpu req", "cpu used",
+        ttk.Label(bar, text="Double-click a pod for details / logs / shell — "
+                  "click ⧉ to open in a new window.").pack(side="left", padx=10)
+        cols = ("open", "namespace", "pod", "node", "phase", "cpu req", "cpu used",
                 "mem req", "mem used", "no lim")
-        tree = self._make_tree(frame, cols, [110, 240, 150, 70, 80, 80, 80, 80, 55])
+        tree = self._make_tree(list_frame, cols, [40, 110, 240, 150, 70, 80, 80, 80, 80, 55])
+        tree.heading("open", text="⧉")
+        tree.column("open", anchor="center", stretch=False)
 
         def refill(*_):
             for r in tree.get_children(""):
@@ -525,8 +687,8 @@ class Dashboard(tk.Tk):
                 hay = f'{p["namespace"]} {p["pod"]} {p["node"]}'.lower()
                 if q and q not in hay:
                     continue
-                tree.insert("", "end", tags=("warn" if p["missing_limits"] else "",), values=(
-                    p["namespace"], p["pod"], p["node"], p["phase"],
+                tree.insert("", "end", values=(
+                    "⧉", p["namespace"], p["pod"], p["node"], p["phase"],
                     fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
                     fmt_mem(p["mem_req_b"]), fmt_mem(p["mem_used_b"]),
                     "⚠" if p["missing_limits"] else "",
@@ -534,9 +696,104 @@ class Dashboard(tk.Tk):
         filt.trace_add("write", refill)
         refill()
 
+        ctx = lambda: self.context_var.get().strip()
+        wire_row_actions(
+            tree,
+            lambda row: ResourceDetailWindow(self, "pod", tree.set(row, "pod"),
+                                             tree.set(row, "namespace"), ctx()),
+            lambda sel: open_inline_detail(frame, list_frame, "pod",
+                                           tree.set(sel, "pod"),
+                                           tree.set(sel, "namespace"), ctx()))
+
+    def _build_pods_by_ns_tab(self):
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="Pods by namespace")
+        self._analysis_frames.append(frame)
+        self._pods_ns_frame = frame
+        self._pods_ns_detail = None
+        # The list lives in its own sub-frame so we can hide it and swap in an
+        # in-place detail view, then bring it back.
+        self._pods_ns_list = ttk.Frame(frame)
+        self._pods_ns_list.pack(fill="both", expand=True)
+        self._build_pods_ns_list(self._pods_ns_list)
+
+    def _build_pods_ns_list(self, parent):
+        bar = ttk.Frame(parent, padding=4)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Namespace:").pack(side="left")
+        namespaces = sorted({p["namespace"] for p in self.model["pods"]})
+        ns_var = tk.StringVar(value=namespaces[0] if namespaces else "")
+        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=28, state="readonly",
+                              values=namespaces)
+        ns_box.pack(side="left", padx=4)
+        count_lbl = ttk.Label(bar, text="")
+        count_lbl.pack(side="left", padx=8)
+
+        # Leading "open" column carries a ⧉ icon: single-click it to pop the pod
+        # out into its own window instead of navigating in-place.
+        cols = ("open", "pod", "ready", "phase", "restarts", "age", "node", "pod ip")
+        tree = self._make_tree(parent, cols,
+                               [44, 280, 60, 100, 70, 70, 160, 120])
+        tree.heading("open", text="⧉")
+        tree.column("open", anchor="center", stretch=False)
+
+        def refill(*_):
+            for r in tree.get_children(""):
+                tree.delete(r)
+            ns = ns_var.get()
+            rows = sorted((p for p in self.model["pods"] if p["namespace"] == ns),
+                          key=lambda p: p["pod"])
+            for p in rows:
+                bad = p["phase"] not in ("Running", "Succeeded") or p["restarts"] > 0
+                tree.insert("", "end", tags=("warn" if bad else "",), values=(
+                    "⧉", p["pod"], p["ready"], p["phase"], p["restarts"],
+                    p["age"], p["node"], p["pod_ip"],
+                ))
+            count_lbl.config(text=f"{len(rows)} pods")
+
+        ns_box.bind("<<ComboboxSelected>>", refill)
+        refill()
+
+        ttk.Label(parent, padding=4, text=(
+            "Double-click a pod to open it here (describe / get / logs / shell). "
+            "Click ⧉ to open it in a separate window instead.")).pack(anchor="w")
+
+        wire_row_actions(
+            tree,
+            lambda row: self._open_pod_window(tree.set(row, "pod"), ns_var.get()),
+            lambda sel: self._open_pod_inplace(tree.set(sel, "pod"), ns_var.get()))
+
+    def _open_pod_window(self, pod, namespace):
+        ResourceDetailWindow(self, "pod", pod, namespace,
+                             self.context_var.get().strip())
+
+    def _open_pod_inplace(self, pod, namespace):
+        if self._pods_ns_detail is not None:
+            self._close_pod_inplace()
+        self._pods_ns_list.pack_forget()
+        self._pods_ns_detail = ResourceDetailView(
+            self._pods_ns_frame, "pod", pod, namespace,
+            self.context_var.get().strip(), on_back=self._close_pod_inplace)
+        self._pods_ns_detail.pack(fill="both", expand=True)
+
+    def _close_pod_inplace(self):
+        if self._pods_ns_detail is not None:
+            self._pods_ns_detail.teardown()
+            self._pods_ns_detail.destroy()
+            self._pods_ns_detail = None
+        self._pods_ns_list.pack(fill="both", expand=True)
+
+    def _build_group_tab(self, group):
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text=group)
+        self._analysis_frames.append(frame)
+        browser = ResourceBrowser(
+            frame, lambda: self.context_var.get().strip(), RESOURCE_GROUPS[group])
+        browser.pack(fill="both", expand=True)
+
     def _build_offenders_tab(self):
         frame = ttk.Frame(self.nb)
-        self.nb.add(frame, text="Biggest offenders")
+        self.nb.add(frame, text="Resource Management")
         self._analysis_frames.append(frame)
         ttk.Label(frame, padding=6, text=(
             "Pods reserving far more memory than they use — the over-provisioning that "
@@ -717,6 +974,908 @@ class Dashboard(tk.Tk):
         msg = ("No data yet — pick a context above and hit “Start capture”."
                if not self._history else f"No records for namespace “{ns}”.")
         self.trends_chart.set_series(series, y_fmt=y_fmt, empty_msg=msg)
+
+
+# kubectl types whose detail view gets a live "Pods" tab (what it runs/deploys).
+_HAS_PODS = {"deployments", "deployment", "statefulsets", "statefulset",
+             "daemonsets", "daemonset", "replicasets", "replicaset",
+             "jobs", "job", "nodes", "node"}
+_DIRECT_OWNER = {"statefulsets": "StatefulSet", "statefulset": "StatefulSet",
+                 "daemonsets": "DaemonSet", "daemonset": "DaemonSet",
+                 "replicasets": "ReplicaSet", "replicaset": "ReplicaSet",
+                 "jobs": "Job", "job": "Job"}
+
+
+def pods_for(ktype, name, namespace, context):
+    """Live-query the pods a controller owns, or the pods running on a node."""
+    if ktype in ("nodes", "node"):
+        pods = kubectl_collect.list_items("pods", all_namespaces=True, context=context)
+        return [p for p in pods if p.get("spec", {}).get("nodeName") == name]
+    if ktype in ("deployments", "deployment"):
+        # Deployment -> its ReplicaSets -> their Pods.
+        rss = kubectl_collect.list_items("replicasets", namespace=namespace, context=context)
+        rs_names = {r["metadata"]["name"] for r in rss
+                    if any(o.get("kind") == "Deployment" and o.get("name") == name
+                           for o in r["metadata"].get("ownerReferences", []))}
+        pods = kubectl_collect.list_items("pods", namespace=namespace, context=context)
+        return [p for p in pods
+                if any(o.get("kind") == "ReplicaSet" and o.get("name") in rs_names
+                       for o in p["metadata"].get("ownerReferences", []))]
+    owner = _DIRECT_OWNER.get(ktype)
+    if owner:
+        pods = kubectl_collect.list_items("pods", namespace=namespace, context=context)
+        return [p for p in pods
+                if any(o.get("kind") == owner and o.get("name") == name
+                       for o in p["metadata"].get("ownerReferences", []))]
+    return []
+
+
+class ResourceDetailView(ttk.Frame):
+    """
+    Inspector for any kubectl resource, embeddable in-place in a tab or a Toplevel.
+
+    Tabs for every kind: Describe, YAML, Events (refreshable snapshots). Pods also
+    get Logs (live stream) and two embedded pipe-terminals (sh / bash) via
+    `kubectl exec -i`. All background processes and polling loops are torn down by
+    teardown().
+    """
+
+    def __init__(self, parent, kind, name, namespace, context, on_back=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.name = name
+        self.namespace = namespace       # "" for cluster-scoped resources
+        self.pod = name                  # alias used by the logs/exec helpers
+        self.context = context
+        self._torn = False
+        self._after_ids = []          # scheduled after() ids to cancel
+        self._procs = []              # every Popen we own (logs + exec shells)
+
+        # async command plumbing (describe/yaml/events run off the UI thread)
+        self._cmd_q: queue.Queue = queue.Queue()
+        # live-logs plumbing
+        self._log_proc = None
+        self._log_q: queue.Queue = queue.Queue()
+        self._log_paused = False
+        # child-pods ("what it deploys" / "pods on node") plumbing
+        self._pods_q: queue.Queue = queue.Queue()
+        self._rpods_rows = {}
+
+        is_pod = kind in ("pod", "pods", "po")
+        nsargs = ["-n", namespace] if namespace else []
+        crumb = (f"{namespace} / " if namespace else "") + f"{kind}/{name}"
+
+        header = ttk.Frame(self, padding=(4, 4, 4, 0))
+        header.pack(fill="x")
+        if on_back is not None:
+            ttk.Button(header, text="← Back", command=on_back).pack(side="left")
+        ttk.Label(header, text=f"  {crumb}", font=("", 10, "bold")).pack(side="left")
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self._build_cmd_tab(nb, "Describe", ["describe", kind, name] + nsargs)
+        self._build_cmd_tab(nb, "YAML", ["get", kind, name] + nsargs + ["-o", "yaml"])
+        if namespace:
+            self._build_cmd_tab(nb, "Events", [
+                "get", "events", "-n", namespace,
+                "--field-selector", f"involvedObject.name={name}"])
+        if is_pod:
+            self._build_logs_tab(nb)
+            self._build_exec_tab(nb, "sh")
+            self._build_exec_tab(nb, "bash")
+        elif kind in _HAS_PODS:
+            self._build_resource_pods_tab(nb)
+
+        self._after_ids.append(self.after(100, self._poll_cmd))
+        # If the frame is destroyed out from under us (e.g. tab rebuild), clean up.
+        self.bind("<Destroy>", lambda e: self.teardown() if e.widget is self else None)
+
+    # -- describe / get (refreshable snapshots) ----------------------------
+    def _build_cmd_tab(self, nb, title, args):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=title)
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        status = ttk.Label(bar, text="")
+        ttk.Button(bar, text="⟳ Refresh",
+                   command=lambda: self._run_cmd(args, txt, status)).pack(side="left")
+        status.pack(side="left", padx=8)
+
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, wrap="none", font=("Consolas", 9),
+                      background="#111", foreground="#ddd", insertbackground="#ddd")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        hs = ttk.Scrollbar(frame, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        hs.pack(fill="x")
+
+        self._run_cmd(args, txt, status)  # populate immediately
+
+    def _run_cmd(self, args, txt, status):
+        status.config(text="⏳ running…")
+
+        def work():
+            try:
+                out = kubectl_collect.run_text(args, context=self.context)
+                self._cmd_q.put((txt, status, out, None))
+            except Exception as e:  # noqa: BLE001 — surfaced in the widget
+                self._cmd_q.put((txt, status, "", e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_cmd(self):
+        if self._torn:
+            return
+        try:
+            while True:
+                txt, status, out, err = self._cmd_q.get_nowait()
+                txt.delete("1.0", "end")
+                if err is not None:
+                    txt.insert("1.0", str(err))
+                    status.config(text="⚠ failed")
+                else:
+                    txt.insert("1.0", out)
+                    status.config(text=f"updated {time.strftime('%H:%M:%S')}")
+        except queue.Empty:
+            pass
+        self._after_ids.append(self.after(150, self._poll_cmd))
+
+    # -- live logs ---------------------------------------------------------
+    def _build_logs_tab(self, nb):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text="Logs (live)")
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        self._log_status = ttk.Label(bar, text="")
+        self._pause_btn = ttk.Button(bar, text="⏸ Pause", command=self._toggle_pause)
+        self._pause_btn.pack(side="left")
+        ttk.Button(bar, text="↻ Restart", command=self._restart_logs).pack(side="left", padx=4)
+        ttk.Button(bar, text="🗑 Clear", command=self._clear_logs).pack(side="left")
+        self._autoscroll = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="auto-scroll", variable=self._autoscroll).pack(side="left", padx=8)
+        self._log_status.pack(side="left", padx=8)
+
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill="both", expand=True)
+        self._log_txt = tk.Text(wrap, wrap="none", font=("Consolas", 9),
+                                background="#0b0b0b", foreground="#cfe3cf")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=self._log_txt.yview)
+        self._log_txt.configure(yscrollcommand=vs.set)
+        self._log_txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+
+        self._start_logs()
+        self._pump_logs()
+
+    def _start_logs(self):
+        try:
+            self._log_proc = kubectl_collect.popen_logs(
+                self.namespace, self.pod, context=self.context)
+            self._procs.append(self._log_proc)
+        except Exception as e:  # noqa: BLE001
+            self._log_txt.insert("end", f"⚠ could not start logs: {e}\n")
+            self._log_status.config(text="⚠ failed")
+            return
+        self._log_status.config(text="● streaming")
+
+        def reader(proc):
+            try:
+                for line in proc.stdout:
+                    self._log_q.put(line)
+            except Exception:  # noqa: BLE001 — process torn down
+                pass
+            self._log_q.put(("__eof__",))
+
+        threading.Thread(target=reader, args=(self._log_proc,), daemon=True).start()
+
+    def _pump_logs(self):
+        if self._torn:
+            return
+        appended = False
+        try:
+            while True:
+                item = self._log_q.get_nowait()
+                if isinstance(item, tuple):  # EOF sentinel
+                    self._log_status.config(text="stream ended")
+                    continue
+                if not self._log_paused:
+                    self._log_txt.insert("end", item)
+                    appended = True
+        except queue.Empty:
+            pass
+        if appended and self._autoscroll.get():
+            self._log_txt.see("end")
+        self._after_ids.append(self.after(200, self._pump_logs))
+
+    def _toggle_pause(self):
+        self._log_paused = not self._log_paused
+        self._pause_btn.config(text="▶ Resume" if self._log_paused else "⏸ Pause")
+        self._log_status.config(text="paused" if self._log_paused else "● streaming")
+
+    def _clear_logs(self):
+        self._log_txt.delete("1.0", "end")
+
+    def _stop_logs(self):
+        self._terminate(self._log_proc)
+        self._log_proc = None
+
+    def _restart_logs(self):
+        self._stop_logs()
+        self._clear_logs()
+        try:
+            while True:
+                self._log_q.get_nowait()
+        except queue.Empty:
+            pass
+        self._start_logs()
+
+    # -- child pods ("what it deploys" / "pods on node") -------------------
+    def _build_resource_pods_tab(self, nb):
+        frame = ttk.Frame(nb)
+        label = "Pods on node" if self.kind in ("nodes", "node") else "Pods"
+        nb.add(frame, text=label)
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        self._rpods_status = ttk.Label(bar, text="")
+        ttk.Button(bar, text="⟳ Refresh",
+                   command=self._load_resource_pods).pack(side="left")
+        self._rpods_status.pack(side="left", padx=8)
+
+        cols = ("namespace", "pod", "ready", "phase", "restarts", "node", "age")
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill="both", expand=True)
+        tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vs.set)
+        for c, w in zip(cols, [110, 300, 60, 90, 70, 150, 70]):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        tree.bind("<Double-1>", lambda e: self._open_child_pod(tree))
+        self._rpods_tree = tree
+        ttk.Label(frame, padding=4,
+                  text="Double-click a pod to open it.").pack(anchor="w")
+
+        self._load_resource_pods()
+        self._after_ids.append(self.after(150, self._poll_resource_pods))
+
+    def _load_resource_pods(self):
+        self._rpods_status.config(text="⏳ loading…")
+
+        def work():
+            try:
+                items = pods_for(self.kind, self.name, self.namespace, self.context)
+                self._pods_q.put(("ok", items))
+            except Exception as e:  # noqa: BLE001
+                self._pods_q.put(("err", e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_resource_pods(self):
+        if self._torn:
+            return
+        try:
+            while True:
+                status, payload = self._pods_q.get_nowait()
+                tree = self._rpods_tree
+                for r in tree.get_children(""):
+                    tree.delete(r)
+                self._rpods_rows = {}
+                if status == "err":
+                    self._rpods_status.config(text=f"⚠ {payload}")
+                else:
+                    for it in sorted(payload, key=lambda x: _meta(x).get("name", "")):
+                        ns = _meta(it).get("namespace", "")
+                        iid = tree.insert("", "end", values=[ns] + _pod_row(it))
+                        self._rpods_rows[iid] = (_meta(it).get("name", ""), ns)
+                    self._rpods_status.config(text=f"{len(payload)} pods")
+        except queue.Empty:
+            pass
+        self._after_ids.append(self.after(400, self._poll_resource_pods))
+
+    def _open_child_pod(self, tree):
+        iid = tree.focus()
+        if not iid or iid not in self._rpods_rows:
+            return
+        name, ns = self._rpods_rows[iid]
+        ResourceDetailWindow(self, "pods", name, ns, self.context)
+
+    # -- embedded shell (kubectl exec -i) ----------------------------------
+    def _build_exec_tab(self, nb, shell):
+        frame = ttk.Frame(nb)
+        nb.add(frame, text=f"Shell: {shell}")
+
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        status = ttk.Label(bar, text="")
+        # Per-tab mutable state so sh and bash don't collide.
+        st = {"proc": None, "q": queue.Queue(), "out": None, "status": status}
+        ttk.Button(bar, text="↻ Reconnect",
+                   command=lambda: self._exec_start(shell, st)).pack(side="left")
+        ttk.Button(bar, text="🗑 Clear",
+                   command=lambda: st["out"].delete("1.0", "end")).pack(side="left", padx=4)
+        status.pack(side="left", padx=8)
+
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill="both", expand=True)
+        out = tk.Text(wrap, wrap="char", font=("Consolas", 9),
+                      background="#0b0b0b", foreground="#e0e0e0", insertbackground="#e0e0e0")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=vs.set)
+        out.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        st["out"] = out
+
+        inbar = ttk.Frame(frame, padding=4)
+        inbar.pack(fill="x")
+        ttk.Label(inbar, text="$").pack(side="left")
+        entry = ttk.Entry(inbar)
+        entry.pack(side="left", fill="x", expand=True, padx=4)
+        entry.bind("<Return>", lambda e: self._exec_send(shell, st, entry))
+        ttk.Button(inbar, text="Send",
+                   command=lambda: self._exec_send(shell, st, entry)).pack(side="left")
+
+        out.insert("end", f"(no {shell} session — press ↻ Reconnect to start)\n"
+                          "Line-oriented shell: ls / cat / env work; "
+                          "full-screen TUIs (vim, top) do not.\n\n")
+        self._exec_start(shell, st)
+        self._exec_pump(st)
+
+    def _exec_start(self, shell, st):
+        self._terminate(st["proc"])
+        try:
+            proc = kubectl_collect.popen_exec(
+                self.namespace, self.pod, shell, context=self.context)
+        except Exception as e:  # noqa: BLE001
+            st["out"].insert("end", f"⚠ could not start {shell}: {e}\n")
+            st["status"].config(text="⚠ failed")
+            return
+        st["proc"] = proc
+        self._procs.append(proc)
+        st["status"].config(text=f"● {shell} connected")
+
+        def reader(p):
+            try:
+                for line in p.stdout:
+                    st["q"].put(line)
+            except Exception:  # noqa: BLE001
+                pass
+            st["q"].put(("__eof__",))
+
+        threading.Thread(target=reader, args=(proc,), daemon=True).start()
+
+    def _exec_send(self, shell, st, entry):
+        cmd = entry.get()
+        proc = st["proc"]
+        if proc is None or proc.poll() is not None:
+            st["out"].insert("end", "⚠ no live shell — press ↻ Reconnect.\n")
+            return
+        st["out"].insert("end", f"$ {cmd}\n")
+        st["out"].see("end")
+        try:
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+        except Exception as e:  # noqa: BLE001 — broken pipe if shell died
+            st["out"].insert("end", f"⚠ write failed: {e}\n")
+        entry.delete(0, "end")
+
+    def _exec_pump(self, st):
+        if self._torn:
+            return
+        appended = False
+        try:
+            while True:
+                item = st["q"].get_nowait()
+                if isinstance(item, tuple):  # EOF
+                    st["status"].config(text="session ended")
+                    continue
+                st["out"].insert("end", item)
+                appended = True
+        except queue.Empty:
+            pass
+        if appended:
+            st["out"].see("end")
+        self._after_ids.append(self.after(120, lambda: self._exec_pump(st)))
+
+    # -- lifecycle ---------------------------------------------------------
+    def _terminate(self, proc):
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def teardown(self):
+        if self._torn:
+            return
+        self._torn = True
+        for aid in self._after_ids:
+            try:
+                self.after_cancel(aid)
+            except Exception:  # noqa: BLE001
+                pass
+        for proc in self._procs:
+            self._terminate(proc)
+
+
+class ResourceDetailWindow(tk.Toplevel):
+    """Thin Toplevel wrapper that hosts a ResourceDetailView in its own window."""
+
+    def __init__(self, parent, kind, name, namespace, context):
+        super().__init__(parent)
+        self.title(f"{namespace + '/' if namespace else ''}{kind}/{name}")
+        self.geometry("1000x680")
+        self.view = ResourceDetailView(self, kind, name, namespace, context)
+        self.view.pack(fill="both", expand=True)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self.view.teardown()
+        self.destroy()
+
+
+def wire_row_actions(tree, on_open_window, on_open_inplace):
+    """
+    Standard row interaction: the leading ⧉ column (single-click) opens a new
+    window; a double-click anywhere else navigates in-place. Assumes the tree's
+    first column is the ⧉ "open" column. Callbacks receive the row iid.
+    """
+    def on_click(e):
+        if tree.identify_region(e.x, e.y) != "cell":
+            return
+        if tree.identify_column(e.x) != "#1":
+            return
+        row = tree.identify_row(e.y)
+        if row:
+            on_open_window(row)
+
+    def on_double(e):
+        if tree.identify_column(e.x) == "#1":
+            return  # the ⧉ column is single-click only
+        sel = tree.focus()
+        if sel:
+            on_open_inplace(sel)
+
+    tree.bind("<Button-1>", on_click)
+    tree.bind("<Double-1>", on_double)
+
+
+def open_inline_detail(host, list_frame, kind, name, namespace, context):
+    """
+    Swap list_frame out for a ResourceDetailView inside host, with a Back button
+    that tears the detail down and restores the list. Returns the detail view.
+    """
+    holder = {}
+
+    def back():
+        d = holder.get("d")
+        if d is not None:
+            d.teardown()
+            d.destroy()
+        list_frame.pack(fill="both", expand=True)
+
+    list_frame.pack_forget()
+    d = ResourceDetailView(host, kind, name, namespace, context, on_back=back)
+    holder["d"] = d
+    d.pack(fill="both", expand=True)
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Generic resource browser (mirrors the k8s Dashboard's read-only views + a few
+# safe, confirmed actions). One registry drives every grouped tab.
+# ---------------------------------------------------------------------------
+def _meta(it):
+    return it.get("metadata", {})
+
+
+def _row_age(it):
+    return age_from(_meta(it).get("creationTimestamp"))
+
+
+class Kind:
+    """One resource type: how to list it, its columns, and what actions it allows."""
+
+    def __init__(self, label, ktype, namespaced, columns, row, *,
+                 scalable=False, restartable=False, deletable=True):
+        self.label = label
+        self.ktype = ktype            # kubectl resource type (e.g. "deployments")
+        self.namespaced = namespaced
+        self.columns = columns        # list of (header, width)
+        self.row = row                # fn(item) -> list[str], len == len(columns)
+        self.scalable = scalable
+        self.restartable = restartable
+        self.deletable = deletable
+
+
+def _pod_row(it):
+    st = it.get("status", {})
+    cs = st.get("containerStatuses", [])
+    total = len(it.get("spec", {}).get("containers", []))
+    ready = sum(1 for c in cs if c.get("ready"))
+    restarts = sum(c.get("restartCount", 0) for c in cs)
+    return [_meta(it)["name"], f"{ready}/{total}", st.get("phase", "?"),
+            str(restarts), it.get("spec", {}).get("nodeName", "—"), _row_age(it)]
+
+
+def _deploy_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    return [_meta(it)["name"], f"{st.get('readyReplicas', 0)}/{sp.get('replicas', 0)}",
+            str(st.get("updatedReplicas", 0)), str(st.get("availableReplicas", 0)),
+            _row_age(it)]
+
+
+def _sts_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    return [_meta(it)["name"], f"{st.get('readyReplicas', 0)}/{sp.get('replicas', 0)}",
+            _row_age(it)]
+
+
+def _ds_row(it):
+    st = it.get("status", {})
+    return [_meta(it)["name"], str(st.get("desiredNumberScheduled", 0)),
+            str(st.get("numberReady", 0)), str(st.get("updatedNumberScheduled", 0)),
+            str(st.get("numberAvailable", 0)), _row_age(it)]
+
+
+def _rs_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    return [_meta(it)["name"], str(sp.get("replicas", 0)),
+            str(st.get("availableReplicas", 0)), str(st.get("readyReplicas", 0)),
+            _row_age(it)]
+
+
+def _job_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    return [_meta(it)["name"], f"{st.get('succeeded', 0)}/{sp.get('completions', 1)}",
+            str(st.get("active", 0)), _row_age(it)]
+
+
+def _cronjob_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    last = st.get("lastScheduleTime", "")
+    return [_meta(it)["name"], sp.get("schedule", ""), str(sp.get("suspend", False)),
+            str(len(st.get("active", []) or [])), last, _row_age(it)]
+
+
+def _svc_row(it):
+    sp = it.get("spec", {})
+    ports = ",".join(str(p.get("port", "")) + ("/" + p.get("protocol", "") if p.get("protocol") else "")
+                     for p in sp.get("ports", []))
+    ext = sp.get("externalIPs") or (it.get("status", {}).get("loadBalancer", {}).get("ingress"))
+    ext_s = ",".join(str(x) for x in ext) if isinstance(ext, list) else (str(ext) if ext else "—")
+    return [_meta(it)["name"], sp.get("type", "ClusterIP"),
+            sp.get("clusterIP", "—"), ext_s, ports, _row_age(it)]
+
+
+def _ing_row(it):
+    sp = it.get("spec", {})
+    hosts = ",".join(r.get("host", "*") for r in sp.get("rules", []) or [])
+    addr = ",".join(i.get("ip", i.get("hostname", ""))
+                    for i in it.get("status", {}).get("loadBalancer", {}).get("ingress", []) or [])
+    return [_meta(it)["name"], sp.get("ingressClassName", "—"), hosts or "—",
+            addr or "—", _row_age(it)]
+
+
+def _endpoints_row(it):
+    n = sum(len(s.get("addresses", []) or []) for s in it.get("subsets", []) or [])
+    return [_meta(it)["name"], str(n), _row_age(it)]
+
+
+def _netpol_row(it):
+    return [_meta(it)["name"],
+            str(bool(it.get("spec", {}).get("podSelector", {}).get("matchLabels"))),
+            _row_age(it)]
+
+
+def _cm_row(it):
+    return [_meta(it)["name"], str(len(it.get("data", {}) or {})), _row_age(it)]
+
+
+def _secret_row(it):
+    return [_meta(it)["name"], it.get("type", ""),
+            str(len(it.get("data", {}) or {})), _row_age(it)]
+
+
+def _pvc_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    cap = st.get("capacity", {}).get("storage", "—")
+    return [_meta(it)["name"], st.get("phase", "?"), sp.get("volumeName", "—"),
+            cap, sp.get("storageClassName", "—"), _row_age(it)]
+
+
+def _pv_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    claim = sp.get("claimRef", {})
+    claim_s = f'{claim.get("namespace","")}/{claim.get("name","")}' if claim else "—"
+    return [_meta(it)["name"], sp.get("capacity", {}).get("storage", "—"),
+            ",".join(sp.get("accessModes", []) or []), sp.get("persistentVolumeReclaimPolicy", ""),
+            st.get("phase", "?"), claim_s, sp.get("storageClassName", "—"), _row_age(it)]
+
+
+def _sc_row(it):
+    return [_meta(it)["name"], it.get("provisioner", ""),
+            it.get("reclaimPolicy", ""), _row_age(it)]
+
+
+RESOURCE_GROUPS = {
+    "Workloads": [
+        Kind("Deployments", "deployments", True,
+             [("name", 280), ("ready", 80), ("up-to-date", 90), ("available", 90), ("age", 80)],
+             _deploy_row, scalable=True, restartable=True),
+        Kind("StatefulSets", "statefulsets", True,
+             [("name", 280), ("ready", 80), ("age", 80)],
+             _sts_row, scalable=True, restartable=True),
+        Kind("DaemonSets", "daemonsets", True,
+             [("name", 260), ("desired", 80), ("ready", 70), ("up-to-date", 90),
+              ("available", 90), ("age", 80)], _ds_row, restartable=True),
+        Kind("ReplicaSets", "replicasets", True,
+             [("name", 300), ("desired", 80), ("available", 90), ("ready", 70), ("age", 80)],
+             _rs_row, scalable=True),
+        Kind("Jobs", "jobs", True,
+             [("name", 300), ("completions", 100), ("active", 70), ("age", 80)], _job_row),
+        Kind("CronJobs", "cronjobs", True,
+             [("name", 240), ("schedule", 120), ("suspend", 80), ("active", 70),
+              ("last schedule", 170), ("age", 80)], _cronjob_row),
+        Kind("Pods", "pods", True,
+             [("name", 300), ("ready", 70), ("phase", 100), ("restarts", 80),
+              ("node", 160), ("age", 80)], _pod_row),
+    ],
+    "Networking": [
+        Kind("Services", "services", True,
+             [("name", 260), ("type", 110), ("cluster IP", 130), ("external", 140),
+              ("ports", 140), ("age", 80)], _svc_row),
+        Kind("Ingresses", "ingresses", True,
+             [("name", 240), ("class", 100), ("hosts", 260), ("address", 160), ("age", 80)],
+             _ing_row),
+        Kind("Endpoints", "endpoints", True,
+             [("name", 320), ("addresses", 100), ("age", 80)], _endpoints_row),
+        Kind("NetworkPolicies", "networkpolicies", True,
+             [("name", 320), ("has selector", 110), ("age", 80)], _netpol_row),
+    ],
+    "Config": [
+        Kind("ConfigMaps", "configmaps", True,
+             [("name", 360), ("data keys", 100), ("age", 80)], _cm_row),
+        Kind("Secrets", "secrets", True,
+             [("name", 320), ("type", 200), ("data keys", 100), ("age", 80)], _secret_row),
+    ],
+    "Storage": [
+        Kind("PersistentVolumeClaims", "persistentvolumeclaims", True,
+             [("name", 260), ("status", 90), ("volume", 220), ("capacity", 90),
+              ("storageclass", 130), ("age", 80)], _pvc_row),
+        Kind("PersistentVolumes", "persistentvolumes", False,
+             [("name", 240), ("capacity", 90), ("access", 120), ("reclaim", 90),
+              ("status", 90), ("claim", 200), ("storageclass", 120), ("age", 70)], _pv_row),
+        Kind("StorageClasses", "storageclasses", False,
+             [("name", 260), ("provisioner", 300), ("reclaim", 110), ("age", 80)], _sc_row),
+    ],
+}
+
+
+class ResourceBrowser(ttk.Frame):
+    """A grouped resource tab: type selector + namespace filter + table + actions."""
+
+    def __init__(self, parent, get_context, kinds):
+        super().__init__(parent)
+        self._get_context = get_context
+        self._kinds = {k.label: k for k in kinds}
+        self._q: queue.Queue = queue.Queue()
+        self._rows = {}               # tree iid -> (name, namespace)
+        self._namespaces = ["(all)"]
+        self._tree = None
+        self._detail = None           # in-place detail view, when open
+        self._alive = True
+        self.bind("<Destroy>", lambda e: setattr(self, "_alive", False)
+                  if e.widget is self else None)
+
+        # All list UI lives in a container we can hide to show a detail in-place.
+        self._list = ttk.Frame(self)
+        self._list.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(self._list, padding=4)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Type:").pack(side="left")
+        self.kind_var = tk.StringVar(value=kinds[0].label)
+        kb = ttk.Combobox(bar, textvariable=self.kind_var, width=22, state="readonly",
+                          values=[k.label for k in kinds])
+        kb.pack(side="left", padx=4)
+        kb.bind("<<ComboboxSelected>>", lambda e: self._reload())
+
+        ttk.Label(bar, text="Namespace:").pack(side="left", padx=(10, 0))
+        self.ns_var = tk.StringVar(value="(all)")
+        self.ns_box = ttk.Combobox(bar, textvariable=self.ns_var, width=22,
+                                   state="readonly", values=self._namespaces)
+        self.ns_box.pack(side="left", padx=4)
+        self.ns_box.bind("<<ComboboxSelected>>", lambda e: self._reload())
+        ttk.Button(bar, text="⟳ Refresh", command=self._reload).pack(side="left", padx=6)
+        self.status = ttk.Label(bar, text="")
+        self.status.pack(side="left", padx=8)
+
+        act = ttk.Frame(self._list, padding=(4, 0, 4, 4))
+        act.pack(fill="x")
+        self.scale_btn = ttk.Button(act, text="Scale…", command=self._do_scale)
+        self.restart_btn = ttk.Button(act, text="Rollout restart", command=self._do_restart)
+        self.delete_btn = ttk.Button(act, text="Delete…", command=self._do_delete)
+        self.scale_btn.pack(side="left")
+        self.restart_btn.pack(side="left", padx=4)
+        self.delete_btn.pack(side="left")
+        ttk.Label(act, text="  (double-click a row to open it here; click ⧉ for a new window)"
+                  ).pack(side="left", padx=6)
+
+        self._table = ttk.Frame(self._list)
+        self._table.pack(fill="both", expand=True)
+
+        self.after(120, self._poll)
+        self._reload()
+
+    def _cur_kind(self):
+        return self._kinds[self.kind_var.get()]
+
+    def _reload(self):
+        if not self._alive:
+            return
+        kind = self._cur_kind()
+        self.ns_box.state(["!disabled"] if kind.namespaced else ["disabled"])
+        self.scale_btn.state(["!disabled"] if kind.scalable else ["disabled"])
+        self.restart_btn.state(["!disabled"] if kind.restartable else ["disabled"])
+        self.delete_btn.state(["!disabled"] if kind.deletable else ["disabled"])
+        self.status.config(text="⏳ loading…")
+        ctx = self._get_context()
+        ns = self.ns_var.get()
+        want_ns = ns if (kind.namespaced and ns != "(all)") else ""
+        all_ns = kind.namespaced and ns == "(all)"
+        need_ns_list = kind.namespaced and self._namespaces == ["(all)"]
+
+        def work():
+            try:
+                items = kubectl_collect.list_items(
+                    kind.ktype, namespace=want_ns, all_namespaces=all_ns, context=ctx)
+                nslist = None
+                if need_ns_list:
+                    nslist = kubectl_collect.list_namespaces(ctx)
+                self._q.put(("ok", kind, items, nslist))
+            except Exception as e:  # noqa: BLE001
+                self._q.put(("err", kind, e, None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self):
+        if not self._alive:
+            return
+        try:
+            while True:
+                status, kind, payload, nslist = self._q.get_nowait()
+                if nslist:
+                    self._namespaces = ["(all)"] + nslist
+                    self.ns_box["values"] = self._namespaces
+                if status == "err":
+                    self.status.config(text=f"⚠ {payload}")
+                elif status == "action_ok":
+                    self.status.config(text=f"✓ {payload}")
+                else:
+                    self._fill(kind, payload)
+        except queue.Empty:
+            pass
+        self.after(200, self._poll)
+
+    def _fill(self, kind, items):
+        for w in self._table.winfo_children():
+            w.destroy()
+        self._rows = {}
+        headers = ["open"] + (["namespace"] if kind.namespaced else []) \
+            + [h for h, _ in kind.columns]
+        widths = [40] + ([120] if kind.namespaced else []) \
+            + [w for _, w in kind.columns]
+
+        wrap = ttk.Frame(self._table)
+        wrap.pack(fill="both", expand=True)
+        tree = ttk.Treeview(wrap, columns=headers, show="headings")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vs.set)
+        for h, w in zip(headers, widths):
+            tree.heading(h, text="⧉" if h == "open" else h)
+            tree.column(h, width=w, anchor=("center" if h == "open" else "w"),
+                        stretch=(h != "open"))
+        tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self._tree = tree
+
+        for it in sorted(items, key=lambda x: _meta(x).get("name", "")):
+            ns = _meta(it).get("namespace", "")
+            vals = ["⧉"] + ([ns] if kind.namespaced else []) + kind.row(it)
+            iid = tree.insert("", "end", values=vals)
+            self._rows[iid] = (_meta(it).get("name", ""), ns)
+        self.status.config(text=f"{len(items)} {kind.label.lower()}")
+
+        wire_row_actions(tree, self._open_window_for, self._open_inplace_for)
+
+    def _row_target(self, iid):
+        if iid not in self._rows:
+            return None
+        name, ns = self._rows[iid]
+        return self._cur_kind(), name, ns
+
+    def _open_window_for(self, iid):
+        t = self._row_target(iid)
+        if t:
+            kind, name, ns = t
+            ResourceDetailWindow(self, kind.ktype, name, ns, self._get_context())
+
+    def _open_inplace_for(self, iid):
+        t = self._row_target(iid)
+        if not t:
+            return
+        kind, name, ns = t
+        self._detail = open_inline_detail(
+            self, self._list, kind.ktype, name, ns, self._get_context())
+
+    def _selection(self):
+        if not self._tree:
+            return None
+        iid = self._tree.focus()
+        if not iid or iid not in self._rows:
+            messagebox.showinfo("No selection", "Select a row first.")
+            return None
+        name, ns = self._rows[iid]
+        return self._cur_kind(), name, ns
+
+    def _do_scale(self):
+        sel = self._selection()
+        if not sel:
+            return
+        kind, name, ns = sel
+        n = simpledialog.askinteger("Scale", f"Replicas for {kind.ktype}/{name}:",
+                                    parent=self, minvalue=0)
+        if n is None:
+            return
+        self._run_action(lambda: kubectl_collect.scale(
+            kind.ktype, name, n, namespace=ns, context=self._get_context()),
+            f"scaled {name} to {n}")
+
+    def _do_restart(self):
+        sel = self._selection()
+        if not sel:
+            return
+        kind, name, ns = sel
+        if not messagebox.askyesno("Rollout restart",
+                                   f"Trigger a rolling restart of {kind.ktype}/{name}?"):
+            return
+        self._run_action(lambda: kubectl_collect.rollout_restart(
+            kind.ktype, name, namespace=ns, context=self._get_context()),
+            f"restarted {name}")
+
+    def _do_delete(self):
+        sel = self._selection()
+        if not sel:
+            return
+        kind, name, ns = sel
+        if not messagebox.askyesno(
+                "Delete", f"Delete {kind.ktype}/{name}"
+                + (f" in {ns}" if ns else "") + "?\n\nThis cannot be undone.",
+                icon="warning"):
+            return
+        self._run_action(lambda: kubectl_collect.delete(
+            kind.ktype, name, namespace=ns, context=self._get_context()),
+            f"deleted {name}")
+
+    def _run_action(self, fn, ok_msg):
+        self.status.config(text="⏳ working…")
+
+        def work():
+            try:
+                fn()
+                self._q.put(("action_ok", self._cur_kind(), ok_msg, None))
+            except Exception as e:  # noqa: BLE001
+                self._q.put(("err", self._cur_kind(), e, None))
+
+        threading.Thread(target=work, daemon=True).start()
+        # reload shortly after so the table reflects the change
+        self.after(600, self._reload)
 
 
 def main():
