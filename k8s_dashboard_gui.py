@@ -1,5 +1,5 @@
 """
-K8s Resource Dashboard — native desktop window, standard library ONLY.
+KR8M — Kubernetes Resource Manager — native desktop window, standard library ONLY.
 
 Why this version: no third-party packages, no web server, no open network port —
 just tkinter (ships with Python). It talks to your cluster by shelling out to the
@@ -17,6 +17,7 @@ Override the kubectl binary for non-standard setups:
 """
 from __future__ import annotations
 
+import csv
 import json
 import queue
 import sys
@@ -293,7 +294,7 @@ def build_model_from_raw(raw: dict) -> dict:
 class Dashboard(tk.Tk):
     def __init__(self, folder: Path):
         super().__init__()
-        self.title("☸ K8s Resource Dashboard")
+        self.title("☸ KR8M — Kubernetes Resource Manager")
         self.geometry("1200x760")
         self.folder = folder
         self.model = {"nodes": [], "pods": [], "deployments": []}
@@ -341,8 +342,36 @@ class Dashboard(tk.Tk):
         self.status = ttk.Label(bar, text="")
         self.status.pack(side="left")
 
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=6, pady=6)
+        # --- Body: collapsible sidebar (hamburger) + notebook content -------
+        # The notebook keeps driving tab content, but its top tab strip is
+        # hidden — navigation lives in the left sidebar instead.
+        style = ttk.Style(self)
+        style.layout("TNotebook.Tab", [])  # hide the built-in tab headers
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self._sidebar_open = True
+        self.sidebar = ttk.Frame(body, padding=(4, 4))
+        self.sidebar.pack(side="left", fill="y")
+
+        # Hamburger toggle sits at the top of the sidebar.
+        top = ttk.Frame(self.sidebar)
+        top.pack(fill="x")
+        self.hamburger_btn = ttk.Button(top, text="☰", width=3,
+                                        command=self._toggle_sidebar)
+        self.hamburger_btn.pack(side="left")
+        self._sidebar_title = ttk.Label(top, text="KR8M", font=("", 10, "bold"))
+        self._sidebar_title.pack(side="left", padx=6)
+
+        # Container that holds one button per notebook tab.
+        self._nav = ttk.Frame(self.sidebar)
+        self._nav.pack(fill="both", expand=True, pady=(6, 0))
+        self._nav_buttons = {}  # tab-id -> ttk.Button
+
+        self.nb = ttk.Notebook(body)
+        self.nb.pack(side="left", fill="both", expand=True)
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         # Persistent Trends tab (never torn down by data reloads).
         self._build_trends_tab()
@@ -361,6 +390,40 @@ class Dashboard(tk.Tk):
         # Open on Nodes, not the (first-created) Trends tab.
         if self._analysis_frames:
             self.nb.select(self._analysis_frames[0])
+
+    # -- sidebar navigation ------------------------------------------------
+    def _rebuild_sidebar(self):
+        """Sync the sidebar buttons to the notebook's current tabs."""
+        for btn in self._nav_buttons.values():
+            btn.destroy()
+        self._nav_buttons = {}
+        current = self.nb.select()
+        for tab_id in self.nb.tabs():
+            text = self.nb.tab(tab_id, "text")
+            btn = ttk.Button(self._nav, text=text,
+                             command=lambda t=tab_id: self.nb.select(t))
+            btn.pack(fill="x", pady=1)
+            self._nav_buttons[tab_id] = btn
+        if current:
+            self._highlight_active(current)
+
+    def _highlight_active(self, tab_id):
+        for tid, btn in self._nav_buttons.items():
+            btn.state(["pressed"] if str(tid) == str(tab_id) else ["!pressed"])
+
+    def _on_tab_changed(self, _event=None):
+        sel = self.nb.select()
+        if sel:
+            self._highlight_active(sel)
+
+    def _toggle_sidebar(self):
+        self._sidebar_open = not self._sidebar_open
+        if self._sidebar_open:
+            self._nav.pack(fill="both", expand=True, pady=(6, 0))
+            self._sidebar_title.pack(side="left", padx=6)
+        else:
+            self._nav.pack_forget()
+            self._sidebar_title.pack_forget()
 
     # -- live cluster ------------------------------------------------------
     def load_contexts(self):
@@ -468,6 +531,8 @@ class Dashboard(tk.Tk):
         # Keep Trends as the last tab.
         self.nb.insert("end", self._trends_frame)
         self._trends_refresh_namespaces()
+        # Rebuild the sidebar to match the (re)built set of tabs.
+        self._rebuild_sidebar()
         # Always land on Overview after a (re)build, not the persistent Trends tab.
         if self._analysis_frames:
             self.nb.select(self._analysis_frames[0])
@@ -476,8 +541,16 @@ class Dashboard(tk.Tk):
     def _make_tree(self, parent, columns, widths=None):
         wrap = ttk.Frame(parent)
         wrap.pack(fill="both", expand=True)
-        tree = ttk.Treeview(wrap, columns=columns, show="headings")
-        vs = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+
+        # Toolbar above every table with a visible export button.
+        tools = ttk.Frame(wrap)
+        tools.pack(side="top", fill="x", pady=(0, 2))
+
+        body = ttk.Frame(wrap)
+        body.pack(side="top", fill="both", expand=True)
+
+        tree = ttk.Treeview(body, columns=columns, show="headings")
+        vs = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vs.set)
         for i, c in enumerate(columns):
             tree.heading(c, text=c, command=lambda col=c, t=tree: self._sort(t, col, False))
@@ -485,7 +558,56 @@ class Dashboard(tk.Tk):
         tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         tree.tag_configure("warn", background="#5a1e1e")
+
+        ttk.Button(tools, text="⬇ Export CSV",
+                   command=lambda t=tree: self._export_tree_csv(t)).pack(side="right")
+
+        # Right-click anywhere in the table also exports it to CSV.
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="Export to CSV…",
+                         command=lambda t=tree: self._export_tree_csv(t))
+
+        def popup(event, t=tree, m=menu):
+            m.tk_popup(event.x_root, event.y_root)
+
+        tree.bind("<Button-3>", popup)      # right-click (Win/Linux)
+        tree.bind("<Button-2>", popup)      # middle/right on some macs
         return tree
+
+    def _export_tree_csv(self, tree):
+        """Write a Treeview's current columns and rows to a CSV file the user picks.
+
+        Exports what's on screen: current sort order and any selection is ignored
+        (all rows are written). Uses only the stdlib csv module.
+        """
+        columns = list(tree["columns"])
+        if not columns:
+            return
+        rows = tree.get_children("")
+        if not rows:
+            messagebox.showinfo("Export to CSV", "This table is empty — nothing to export.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Export table to CSV",
+            defaultextension=".csv",
+            initialfile=f"k8s-export-{time.strftime('%Y%m%d-%H%M%S')}.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        headers = [tree.heading(c, "text") or c for c in columns]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                for iid in rows:
+                    writer.writerow([tree.set(iid, c) for c in columns])
+        except OSError as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+        self.status.config(text=f"✓ exported {len(rows)} rows → {path}")
 
     def _sort(self, tree, col, desc):
         data = [(tree.set(k, col), k) for k in tree.get_children("")]
@@ -555,6 +677,10 @@ class Dashboard(tk.Tk):
             self.after(0, lambda: done(data))
 
         def done(data):
+            # Clear the "refreshing…" state first. apply_fn may override this
+            # with its own message (e.g. a row count); tabs that don't will keep
+            # this success line instead of a stuck spinner.
+            status_lbl.config(text=f"✓ updated {time.strftime('%H:%M:%S')}")
             try:
                 apply_fn(data)
             except Exception as e:  # noqa: BLE001
@@ -1115,6 +1241,14 @@ class Dashboard(tk.Tk):
             self._scoped_refresh(fetch, apply, status)
 
         ttk.Button(bar, text="⟳ Refresh pods", command=do_refresh).pack(side="left")
+
+        ttk.Label(bar, text="Namespace:").pack(side="left", padx=(12, 2))
+        ns_filter = tk.StringVar(value="All namespaces")
+        ns_box = ttk.Combobox(bar, textvariable=ns_filter, width=24, state="readonly",
+                              values=["All namespaces"])
+        ns_box.pack(side="left")
+        ns_box.bind("<<ComboboxSelected>>", lambda _e: refill())
+
         status.pack(side="left", padx=8)
 
         ttk.Label(frame, padding=6, text=(
@@ -1128,7 +1262,18 @@ class Dashboard(tk.Tk):
         def refill():
             for r in tree.get_children(""):
                 tree.delete(r)
-            rows = [p for p in self.model["pods"] if p["mem_used_b"] is not None]
+            metered = [p for p in self.model["pods"] if p["mem_used_b"] is not None]
+
+            # Keep the namespace picker in sync with the current data, preserving
+            # the user's selection when it still exists.
+            namespaces = sorted({p["namespace"] for p in metered})
+            ns_box["values"] = ["All namespaces"] + namespaces
+            if ns_filter.get() not in ns_box["values"]:
+                ns_filter.set("All namespaces")
+
+            selected = ns_filter.get()
+            rows = ([p for p in metered if p["namespace"] == selected]
+                    if selected != "All namespaces" else metered)
             rows.sort(key=lambda p: p["mem_req_b"] - (p["mem_used_b"] or 0), reverse=True)
             for p in rows[:40]:
                 waste = p["mem_req_b"] - (p["mem_used_b"] or 0)
