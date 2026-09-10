@@ -852,9 +852,9 @@ class Dashboard(tk.Tk):
         status.pack(side="left", padx=8)
 
         cols = ("open", "node", "pool", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
-                "mem alloc", "mem req%", "mem used%", "⚠ why")
+                "mem alloc", "mem req", "mem req%", "mem used", "mem used%", "⚠ why")
         tree = self._make_tree(list_frame, cols,
-                               [40, 150, 130, 70, 55, 90, 80, 80, 90, 80, 80, 200])
+                               [40, 150, 130, 70, 55, 90, 80, 80, 90, 90, 80, 90, 80, 200])
         tree.heading("open", text="⧉")
         tree.column("open", anchor="center", stretch=False)
 
@@ -893,7 +893,8 @@ class Dashboard(tk.Tk):
                     "⧉", n["node"], n["pool"], n["ready"], a["pods"],
                     fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
                     pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
-                    fmt_mem(n["mem_alloc_b"]), f"{req_mem_p:.0f}%",
+                    fmt_mem(n["mem_alloc_b"]), fmt_mem(a["mem"]), f"{req_mem_p:.0f}%",
+                    fmt_mem(n["mem_used_b"]) if n["mem_used_b"] is not None else "—",
                     pct(n["mem_used_b"], n["mem_alloc_b"]) if n["mem_used_b"] is not None else "—",
                     "; ".join(why),
                 ))
