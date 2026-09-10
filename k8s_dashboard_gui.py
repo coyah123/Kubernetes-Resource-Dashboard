@@ -185,12 +185,37 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
     }
 
 
+# Well-known labels that name the node pool / node group, most specific first.
+# Covers AWS EKS (managed node groups + Karpenter), Azure AKS, and GKE.
+_POOL_LABELS = (
+    "eks.amazonaws.com/nodegroup",      # EKS managed node group
+    "karpenter.sh/nodepool",            # Karpenter (newer)
+    "karpenter.sh/provisioner-name",    # Karpenter (older)
+    "agentpool",                        # AKS (short form)
+    "kubernetes.azure.com/agentpool",   # AKS (fully-qualified)
+    "cloud.google.com/gke-nodepool",    # GKE
+    "node.kubernetes.io/instancegroup",
+    "nodepool",
+)
+
+
+def node_pool_from_labels(labels: dict) -> str:
+    """Best-effort node-pool name from the standard cloud labels; — if none set."""
+    labels = labels or {}
+    for key in _POOL_LABELS:
+        val = labels.get(key)
+        if val:
+            return val
+    return "—"
+
+
 def build_node_row(n: dict, usage=(None, None)) -> dict:
     alloc = n["status"].get("allocatable", {})
     ready = next((c["status"] for c in n["status"].get("conditions", [])
                   if c["type"] == "Ready"), "?")
     return {
         "node": n["metadata"]["name"], "ready": ready,
+        "pool": node_pool_from_labels(n["metadata"].get("labels")),
         "cpu_alloc_m": cpu_to_milli(alloc.get("cpu")),
         "mem_alloc_b": mem_to_bytes(alloc.get("memory")),
         "cpu_used_m": usage[0], "mem_used_b": usage[1],
@@ -816,18 +841,34 @@ class Dashboard(tk.Tk):
             self._scoped_refresh(fetch, apply, status)
 
         ttk.Button(bar, text="⟳ Refresh nodes", command=do_refresh).pack(side="left")
+
+        ttk.Label(bar, text="Node pool:").pack(side="left", padx=(12, 2))
+        pool_filter = tk.StringVar(value="All pools")
+        pool_box = ttk.Combobox(bar, textvariable=pool_filter, width=24, state="readonly",
+                                values=["All pools"])
+        pool_box.pack(side="left")
+        pool_box.bind("<<ComboboxSelected>>", lambda _e: refill())
+
         status.pack(side="left", padx=8)
 
-        cols = ("open", "node", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
+        cols = ("open", "node", "pool", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
                 "mem alloc", "mem req%", "mem used%", "⚠ why")
         tree = self._make_tree(list_frame, cols,
-                               [40, 150, 70, 55, 90, 80, 80, 90, 80, 80, 200])
+                               [40, 150, 130, 70, 55, 90, 80, 80, 90, 80, 80, 200])
         tree.heading("open", text="⧉")
         tree.column("open", anchor="center", stretch=False)
 
         def refill():
             for r in tree.get_children(""):
                 tree.delete(r)
+
+            # Keep the pool picker in sync with the current nodes, preserving choice.
+            pools = sorted({n["pool"] for n in self.model["nodes"]})
+            pool_box["values"] = ["All pools"] + pools
+            if pool_filter.get() not in pool_box["values"]:
+                pool_filter.set("All pools")
+            selected = pool_filter.get()
+
             # aggregate pod requests per node (from the current pod model)
             agg = {}
             for p in self.model["pods"]:
@@ -836,6 +877,8 @@ class Dashboard(tk.Tk):
                 a["cpu"] += p["cpu_req_m"]
                 a["mem"] += p["mem_req_b"]
             for n in self.model["nodes"]:
+                if selected != "All pools" and n["pool"] != selected:
+                    continue
                 a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
                 req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
                 req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
@@ -847,7 +890,7 @@ class Dashboard(tk.Tk):
                 if n["ready"] != "True":
                     why.append(f"NotReady ({n['ready']})")
                 tree.insert("", "end", tags=("warn" if why else "",), values=(
-                    "⧉", n["node"], n["ready"], a["pods"],
+                    "⧉", n["node"], n["pool"], n["ready"], a["pods"],
                     fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
                     pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
                     fmt_mem(n["mem_alloc_b"]), f"{req_mem_p:.0f}%",
