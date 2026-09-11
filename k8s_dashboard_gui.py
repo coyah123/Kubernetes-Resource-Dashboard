@@ -86,15 +86,29 @@ def pct(n, d):
     return f"{n/d*100:.0f}%" if d else "—"
 
 
-def age_from(ts):
-    """Kubernetes creationTimestamp (ISO8601 Z) -> compact age like '3d4h', '12m'."""
+# A pod that restarted within this window is "flapping now" → amber. A large
+# window would light up pods that bounced hours ago on a node drain; CrashLoop
+# backoff caps at 5-min gaps, so 10 min catches slow flappers without stale noise.
+RECENT_RESTART_SECS = 10 * 60
+
+
+def _secs_since_iso(ts):
+    """Seconds since a Kubernetes ISO8601-Z timestamp, or None if unparseable."""
     if not ts:
-        return "—"
+        return None
     try:
         t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
+        return None
+    return (datetime.now(timezone.utc) - t).total_seconds()
+
+
+def age_from(ts):
+    """Kubernetes creationTimestamp (ISO8601 Z) -> compact age like '3d4h', '12m'."""
+    secs = _secs_since_iso(ts)
+    if secs is None:
         return "—"
-    secs = int((datetime.now(timezone.utc) - t).total_seconds())
+    secs = int(secs)
     if secs < 0:
         secs = 0
     d, rem = divmod(secs, 86400)
@@ -148,6 +162,7 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
     restarts = sum(cs.get("restartCount", 0) for cs in cstatuses)
     # Human-readable reason a pod is unhealthy (empty string == healthy).
     reasons = []
+    last_restart_secs = None  # seconds since the most recent container restart
     for cs in cstatuses:
         cstate = cs.get("state", {})
         w, t = cstate.get("waiting"), cstate.get("terminated")
@@ -155,6 +170,15 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
             reasons.append(w["reason"])
         elif t and t.get("reason") and t.get("exitCode"):
             reasons.append(t["reason"])
+        # When a container has restarted, the prior instance's death time
+        # (lastState.terminated.finishedAt) marks when the restart happened.
+        if cs.get("restartCount", 0):
+            fin = cs.get("lastState", {}).get("terminated", {}).get("finishedAt")
+            secs = _secs_since_iso(fin)
+            if secs is not None and (last_restart_secs is None or secs < last_restart_secs):
+                last_restart_secs = secs
+    restarted_recently = (last_restart_secs is not None
+                          and last_restart_secs <= RECENT_RESTART_SECS)
     note_parts = []
     if phase not in ("Running", "Succeeded"):
         note_parts.append(phase)
@@ -175,11 +199,21 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
         mem_lim += mem_to_bytes(lim.get("memory"))
         if not lim.get("cpu") or not lim.get("memory"):
             missing += 1
+    # Severity for row coloring: "crit" = actively failing (bad phase, or a
+    # container stuck/crashed), "warn" = running but restarted *recently* (flapping
+    # now), "" = healthy. Old restarts from a long-ago node drain don't earn a color.
+    if phase not in ("Running", "Succeeded") or reasons:
+        severity = "crit"
+    elif restarted_recently:
+        severity = "warn"
+    else:
+        severity = ""
     return {
         "namespace": ns, "pod": name, "node": node, "phase": phase, "owner": owner,
         "ready": f"{n_ready}/{n_total}", "restarts": restarts,
         "age": age_from(p["metadata"].get("creationTimestamp")),
         "pod_ip": status.get("podIP", "—"), "status_note": ", ".join(note_parts),
+        "severity": severity,
         "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
         "cpu_used_m": usage[0], "mem_used_b": usage[1], "missing_limits": missing,
     }
@@ -370,8 +404,11 @@ class Dashboard(tk.Tk):
         # --- Body: collapsible sidebar (hamburger) + notebook content -------
         # The notebook keeps driving tab content, but its top tab strip is
         # hidden — navigation lives in the left sidebar instead.
+        # Hide the tab strip ONLY on the main notebook (nav lives in the sidebar).
+        # Use a dedicated style name so detail-view notebooks (Describe/YAML/Logs/
+        # exec) keep their normal, clickable tab headers.
         style = ttk.Style(self)
-        style.layout("TNotebook.Tab", [])  # hide the built-in tab headers
+        style.layout("Sidebar.TNotebook.Tab", [])
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=6, pady=6)
@@ -394,7 +431,7 @@ class Dashboard(tk.Tk):
         self._nav.pack(fill="both", expand=True, pady=(6, 0))
         self._nav_buttons = {}  # tab-id -> ttk.Button
 
-        self.nb = ttk.Notebook(body)
+        self.nb = ttk.Notebook(body, style="Sidebar.TNotebook")
         self.nb.pack(side="left", fill="both", expand=True)
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
@@ -549,7 +586,6 @@ class Dashboard(tk.Tk):
         self._build_nodes_tab()
         self._build_deploys_tab()
         self._build_pods_tab()
-        self._build_pods_by_ns_tab()
         self._build_offenders_tab()
         for group in RESOURCE_GROUPS:
             self._build_group_tab(group)
@@ -582,7 +618,8 @@ class Dashboard(tk.Tk):
             tree.column(c, width=(widths[i] if widths else 120), anchor="w")
         tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        tree.tag_configure("warn", background="#5a1e1e")
+        tree.tag_configure("crit", background="#5a1e1e")   # red — failing
+        tree.tag_configure("warn", background="#5a4a1e")   # amber — heads-up
 
         ttk.Button(tools, text="⬇ Export CSV",
                    command=lambda t=tree: self._export_tree_csv(t)).pack(side="right")
@@ -887,9 +924,12 @@ class Dashboard(tk.Tk):
                     why.append(f"CPU {req_cpu_p:.0f}% requested")
                 if req_mem_p > 85:
                     why.append(f"mem {req_mem_p:.0f}% requested")
-                if n["ready"] != "True":
+                not_ready = n["ready"] != "True"
+                if not_ready:
                     why.append(f"NotReady ({n['ready']})")
-                tree.insert("", "end", tags=("warn" if why else "",), values=(
+                # NotReady is red (failing); over-provisioning alone is amber.
+                sev = "crit" if not_ready else ("warn" if why else "")
+                tree.insert("", "end", tags=(sev,), values=(
                     "⧉", n["node"], n["pool"], n["ready"], a["pods"],
                     fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
                     pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
@@ -1041,31 +1081,50 @@ class Dashboard(tk.Tk):
         list_frame.pack(fill="both", expand=True)
         bar = ttk.Frame(list_frame, padding=4)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Filter:").pack(side="left")
-        filt = tk.StringVar()
-        ttk.Entry(bar, textvariable=filt, width=40).pack(side="left", padx=4)
         ctx = lambda: self.context_var.get().strip()
+
+        ttk.Label(bar, text="Namespace:").pack(side="left")
+        namespaces = ["(all)"] + sorted({p["namespace"] for p in self.model["pods"]})
+        ns_var = tk.StringVar(value="(all)")
+        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=24, state="readonly",
+                              values=namespaces)
+        ns_box.pack(side="left", padx=4)
+
+        ttk.Label(bar, text="Filter:").pack(side="left", padx=(10, 0))
+        filt = tk.StringVar()
+        ttk.Entry(bar, textvariable=filt, width=30).pack(side="left", padx=4)
         refresh_status = ttk.Label(bar, text="")
 
         def do_refresh():
+            ns = ns_var.get()
+            allns = ns == "(all)"
+
             def fetch():
-                items = kubectl_collect.list_items("pods", all_namespaces=True, context=ctx())
+                items = kubectl_collect.list_items(
+                    "pods", namespace="" if allns else ns,
+                    all_namespaces=allns, context=ctx())
                 usage = usage_map_from_metrics(kubectl_collect.pod_metrics(ctx()))
-                return [build_pod_row(
+                rows = [build_pod_row(
                     it, usage.get((it["metadata"]["namespace"], it["metadata"]["name"]),
                                   (None, None))) for it in items]
+                return (ns, rows)
 
-            def apply(rows):
-                self.model["pods"] = rows
+            def apply(data):
+                scope, rows = data
+                if scope == "(all)":
+                    self.model["pods"] = rows
+                else:
+                    self.model["pods"] = [
+                        p for p in self.model["pods"] if p["namespace"] != scope] + rows
                 refill()
             self._scoped_refresh(fetch, apply, refresh_status)
 
         ttk.Button(bar, text="⟳ Refresh pods", command=do_refresh).pack(side="left", padx=6)
         refresh_status.pack(side="left", padx=6)
-        cols = ("sel", "open", "namespace", "pod", "node", "phase", "cpu req", "cpu used",
-                "mem req", "mem used", "no lim", "⚠ why")
+        cols = ("sel", "open", "namespace", "pod", "node", "ready", "phase", "restarts",
+                "age", "cpu req", "cpu used", "mem req", "mem used", "no lim", "⚠ why")
         tree = self._make_tree(list_frame, cols,
-                               [34, 40, 110, 240, 150, 70, 80, 80, 80, 80, 55, 200])
+                               [34, 40, 110, 220, 140, 60, 80, 70, 60, 80, 80, 80, 80, 50, 180])
         tree.heading("sel", text="☑")
         tree.heading("open", text="⧉")
         tree.column("sel", anchor="center", stretch=False)
@@ -1076,13 +1135,17 @@ class Dashboard(tk.Tk):
             for r in tree.get_children(""):
                 tree.delete(r)
             q = filt.get().lower()
+            ns = ns_var.get()
             rows = sorted(self.model["pods"], key=lambda p: p["mem_req_b"], reverse=True)
             for p in rows:
+                if ns != "(all)" and p["namespace"] != ns:
+                    continue
                 hay = f'{p["namespace"]} {p["pod"]} {p["node"]}'.lower()
                 if q and q not in hay:
                     continue
-                tree.insert("", "end", tags=("warn" if p["status_note"] else "",), values=(
-                    "☐", "⧉", p["namespace"], p["pod"], p["node"], p["phase"],
+                tree.insert("", "end", tags=(p["severity"],), values=(
+                    "☐", "⧉", p["namespace"], p["pod"], p["node"], p["ready"], p["phase"],
+                    p["restarts"], p["age"],
                     fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
                     fmt_mem(p["mem_req_b"]), fmt_mem(p["mem_used_b"]),
                     "⚠" if p["missing_limits"] else "", p["status_note"],
@@ -1095,6 +1158,7 @@ class Dashboard(tk.Tk):
             lambda sel: open_inline_detail(frame, list_frame, "pod",
                                            tree.set(sel, "pod"),
                                            tree.set(sel, "namespace"), ctx()))
+        ns_box.bind("<<ComboboxSelected>>", refill)
         filt.trace_add("write", refill)
         refill()
 
@@ -1121,137 +1185,11 @@ class Dashboard(tk.Tk):
         ttk.Button(act, text="Delete…", command=do_delete).pack(side="left")
         act_status.pack(side="left", padx=8)
 
-        ttk.Label(list_frame, text="Tick ☑ to select multiple (or just click a row), then "
-                  "Delete. Double-click a pod for details / logs / shell; click ⧉ for a "
-                  "new window. Red row = unhealthy; the “⚠ why” column says why.",
+        ttk.Label(list_frame, text="Pick a namespace or “(all)”, and/or type in Filter. Tick ☑ "
+                  "to select multiple (or just click a row), then Delete. Double-click a pod "
+                  "for details / logs / shell; click ⧉ for a new window. Red = failing, "
+                  "amber = running but restarted; the “⚠ why” column says why.",
                   padding=4).pack(anchor="w")
-
-    def _build_pods_by_ns_tab(self):
-        frame = ttk.Frame(self.nb)
-        self.nb.add(frame, text="Pods by namespace")
-        self._analysis_frames.append(frame)
-        self._pods_ns_frame = frame
-        self._pods_ns_detail = None
-        # The list lives in its own sub-frame so we can hide it and swap in an
-        # in-place detail view, then bring it back.
-        self._pods_ns_list = ttk.Frame(frame)
-        self._pods_ns_list.pack(fill="both", expand=True)
-        self._build_pods_ns_list(self._pods_ns_list)
-
-    def _build_pods_ns_list(self, parent):
-        bar = ttk.Frame(parent, padding=4)
-        bar.pack(fill="x")
-        ttk.Label(bar, text="Namespace:").pack(side="left")
-        namespaces = sorted({p["namespace"] for p in self.model["pods"]})
-        ns_var = tk.StringVar(value=namespaces[0] if namespaces else "")
-        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=28, state="readonly",
-                              values=namespaces)
-        ns_box.pack(side="left", padx=4)
-        ctx = lambda: self.context_var.get().strip()
-
-        def do_refresh():
-            ns = ns_var.get()
-            if not ns:
-                return
-
-            def fetch():
-                items = kubectl_collect.list_items("pods", namespace=ns, context=ctx())
-                return (ns, [build_pod_row(it) for it in items])
-
-            def apply(data):
-                scope, rows = data
-                # Replace only this namespace's pods in the model, then redraw.
-                self.model["pods"] = [
-                    p for p in self.model["pods"] if p["namespace"] != scope] + rows
-                refill()
-            self._scoped_refresh(fetch, apply, count_lbl)
-
-        ttk.Button(bar, text="⟳ Refresh namespace",
-                   command=do_refresh).pack(side="left", padx=6)
-        count_lbl = ttk.Label(bar, text="")
-        count_lbl.pack(side="left", padx=8)
-
-        # Leading "sel" (☐/☑) + "open" (⧉) columns drive multi-select and the
-        # single-click new-window shortcut.
-        cols = ("sel", "open", "pod", "ready", "phase", "restarts", "age",
-                "node", "pod ip", "⚠ why")
-        tree = self._make_tree(parent, cols,
-                               [34, 44, 260, 60, 90, 70, 70, 150, 120, 200])
-        tree.heading("sel", text="☑")
-        tree.heading("open", text="⧉")
-        tree.column("sel", anchor="center", stretch=False)
-        tree.column("open", anchor="center", stretch=False)
-
-        def refill(*_):
-            ms.reset()
-            for r in tree.get_children(""):
-                tree.delete(r)
-            ns = ns_var.get()
-            rows = sorted((p for p in self.model["pods"] if p["namespace"] == ns),
-                          key=lambda p: p["pod"])
-            for p in rows:
-                tree.insert("", "end", tags=("warn" if p["status_note"] else "",), values=(
-                    "☐", "⧉", p["pod"], p["ready"], p["phase"], p["restarts"],
-                    p["age"], p["node"], p["pod_ip"], p["status_note"],
-                ))
-            count_lbl.config(text=f"{len(rows)} pods")
-
-        ms = MultiSelect(
-            tree,
-            lambda row: self._open_pod_window(tree.set(row, "pod"), ns_var.get()),
-            lambda sel: self._open_pod_inplace(tree.set(sel, "pod"), ns_var.get()))
-        ns_box.bind("<<ComboboxSelected>>", refill)
-        refill()
-
-        act = ttk.Frame(parent, padding=(4, 0, 4, 4))
-        act.pack(fill="x")
-        act_status = ttk.Label(act, text="")
-        ctx = lambda: self.context_var.get().strip()
-
-        def do_delete():
-            ns = ns_var.get()
-            items = [(i, "pod", tree.set(i, "pod"), ns) for i in ms.targets()]
-            if not items:
-                messagebox.showinfo("Nothing selected", "Check rows, or select one.")
-                return
-            names = ", ".join(n for _, _, n, _ in items[:5]) + ("…" if len(items) > 5 else "")
-            if not messagebox.askyesno(
-                    "Delete", f"Delete {len(items)} pod(s) in {ns}?\n\n{names}\n\n"
-                    "Managed pods will be recreated by their controller.",
-                    icon="warning"):
-                return
-            self._run_bulk(items, lambda kt, n, nns: kubectl_collect.delete(
-                kt, n, namespace=nns, context=ctx()), "Deleted", act_status,
-                tree=tree, remove_on_success=True)
-
-        ttk.Button(act, text="Delete…", command=do_delete).pack(side="left")
-        act_status.pack(side="left", padx=8)
-
-        ttk.Label(parent, padding=4, text=(
-            "Tick ☑ to select multiple (or just click a row), then Delete. "
-            "Double-click a pod to open it here (describe / logs / shell); click ⧉ for a "
-            "separate window. Red row = unhealthy; the “⚠ why” column says why.")
-            ).pack(anchor="w")
-
-    def _open_pod_window(self, pod, namespace):
-        ResourceDetailWindow(self, "pod", pod, namespace,
-                             self.context_var.get().strip())
-
-    def _open_pod_inplace(self, pod, namespace):
-        if self._pods_ns_detail is not None:
-            self._close_pod_inplace()
-        self._pods_ns_list.pack_forget()
-        self._pods_ns_detail = ResourceDetailView(
-            self._pods_ns_frame, "pod", pod, namespace,
-            self.context_var.get().strip(), on_back=self._close_pod_inplace)
-        self._pods_ns_detail.pack(fill="both", expand=True)
-
-    def _close_pod_inplace(self):
-        if self._pods_ns_detail is not None:
-            self._pods_ns_detail.teardown()
-            self._pods_ns_detail.destroy()
-            self._pods_ns_detail = None
-        self._pods_ns_list.pack(fill="both", expand=True)
 
     def _build_group_tab(self, group):
         frame = ttk.Frame(self.nb)
