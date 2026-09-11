@@ -1,5 +1,6 @@
 """
-KR8M — Kubernetes Resource Manager — native desktop window, standard library ONLY.
+CULMIN8 — Client-side, Ultra-Lightweight Manager, Inspector & Navigator for K8s
+— native desktop window, standard library ONLY.
 
 Why this version: no third-party packages, no web server, no open network port —
 just tkinter (ships with Python). It talks to your cluster by shelling out to the
@@ -353,7 +354,7 @@ def build_model_from_raw(raw: dict) -> dict:
 class Dashboard(tk.Tk):
     def __init__(self, folder: Path):
         super().__init__()
-        self.title("☸ KR8M — Kubernetes Resource Manager")
+        self.title("☸ CULMIN8 — Manager, Inspector & Navigator for K8s")
         self.geometry("1200x760")
         self.folder = folder
         self.model = {"nodes": [], "pods": [], "deployments": []}
@@ -423,7 +424,7 @@ class Dashboard(tk.Tk):
         self.hamburger_btn = ttk.Button(top, text="☰", width=3,
                                         command=self._toggle_sidebar)
         self.hamburger_btn.pack(side="left")
-        self._sidebar_title = ttk.Label(top, text="KR8M", font=("", 10, "bold"))
+        self._sidebar_title = ttk.Label(top, text="CULMIN8", font=("", 10, "bold"))
         self._sidebar_title.pack(side="left", padx=6)
 
         # Container that holds one button per notebook tab.
