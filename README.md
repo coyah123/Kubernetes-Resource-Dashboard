@@ -17,8 +17,8 @@ Windows, macOS, and Linux.
 
 ## Prerequisites
 
-You need three things on your machine. No `pip install` is required for the
-desktop app itself — it uses only the Python standard library.
+You need three things on your machine (plus one optional extra). No `pip install`
+is required for the desktop app itself — it uses only the Python standard library.
 
 1. **Python 3** with **tkinter** (the GUI toolkit).
    - The official installer from [python.org](https://www.python.org/downloads/)
@@ -34,6 +34,16 @@ desktop app itself — it uses only the Python standard library.
      dropdown will list) and `kubectl get nodes` (proves you can connect + auth).
    - The app only sees clusters already configured on *your* machine; it never
      copies or ships a kubeconfig for you.
+4. **openssl** on your PATH — *optional*, only for **TLS certificate inspection**
+   in a Secret's **Get secret** tab (chain summary, expiry, SAN, fingerprint).
+   - Everything else works without it; if it's absent, the cert inspector simply
+     shows install guidance instead of failing.
+   - The app shells out to the `openssl` **command-line tool** (like it does with
+     kubectl) — it does **not** use any Python crypto library.
+   - Verify with: `openssl version`.
+   - Install: `brew install openssl` (macOS), `winget install ShiningLight.OpenSSL`
+     or `choco install openssl` (Windows — Git for Windows also bundles one under
+     `C:\Program Files\Git\usr\bin`), or your distro's package manager (Linux).
 
 ## Usage
 
@@ -73,10 +83,17 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
   embedded **shell**; **tick ☑ rows to bulk delete** (see below)
 - **Pods by namespace** — pick a namespace, browse its pods, open any one, or
   **tick ☑ to bulk delete**
-- **Workloads / Networking / Config / Storage** — browse (almost) every resource
-  type live, grouped like the official k8s Dashboard's sidebar; open any item for
-  its details, and run a few **safe, confirmed actions** (scale / rollout restart /
-  delete)
+- **Workloads / Networking / Config / Storage / Security / RBAC** — browse (almost)
+  every resource type live, grouped like the official k8s Dashboard's sidebar; open
+  any item for its details, and run a few **safe, confirmed actions** (scale /
+  rollout restart / delete). **Security / RBAC** covers ServiceAccounts, Roles,
+  ClusterRoles, RoleBindings and ClusterRoleBindings (with a ⚠ flag on wildcard
+  rules); ClusterRoleBindings can be filtered by their subjects' namespace.
+- **Custom Resources** — discovers **every CRD installed in the cluster** at refresh
+  (cert-manager, Argo, Gateway API, NGINX VirtualServers/TransportServers, …) and
+  lets you browse instances of any of them, using each CRD's own
+  `additionalPrinterColumns` so you see its author-defined state. A **⟳ Reload
+  CRDs** button re-discovers after installing/removing an operator.
 - **Resource Management** — pods reserving far more memory than they actually use
 - **Trends** — record resource use over time and graph it (see below)
 
@@ -112,6 +129,29 @@ pause / restart / clear / auto-scroll — and two embedded terminals, **Shell: s
 and **Shell: bash**, via `kubectl exec -i`. Controllers (Deployments, StatefulSets,
 DaemonSets, ReplicaSets, Jobs) and Nodes also get a **Pods** tab listing what they
 run, itself clickable.
+
+**Live edit** — every detail view has an **✎ Edit (kubectl edit)** button that
+launches `kubectl edit <kind>/<name>` in a **new terminal window**. It's not a
+built-in editor; it hands off to kubectl's own flow using your
+`$KUBE_EDITOR`/`$EDITOR` (Notepad on Windows) — save applies to the cluster, quit
+without saving cancels. Click **⟳ Refresh** on a tab afterward to see the result.
+
+**Secrets** get an extra **Get secret** tab: each `data` key is listed with its
+value **hidden by default** behind a **Reveal values** toggle, a **Decoder**
+dropdown (**Base64** first), and a per-key **Copy**. Non-text values render as
+`<binary: N bytes>` + hex. If a value is a **PEM certificate**, a **🔎 Inspect
+cert** button opens `openssl`-powered views — **Chain summary** (per-cert
+subject/issuer/validity with days-left / expired flags and a chain-linkage check),
+Full text, Dates, Subject/Issuer, SAN, SHA-256 fingerprint, Serial. This shells out
+to the `openssl` binary on your PATH (see Prerequisites); if it's absent the window
+shows install guidance instead of failing.
+
+**kubectl command buffer** — a bar pinned to the bottom of the window shows the
+kubectl command behind whatever you're doing, so the GUI teaches the CLI rather than
+hiding it. Highlight any row and it shows the `kubectl get … -o yaml` you'd run to
+fetch that object (tagged *selected*); anything the app actually runs shows tagged
+*last run*. A **Copy** button puts it on your clipboard. Commands include
+`--context` and honor the `KUBECTL` override, so they're copy-paste runnable.
 
 > The embedded shells are line-oriented (no TTY): `ls`, `cat`, `env` work fine, but
 > full-screen programs (`vim`, `top`) and shell prompts won't render. Use `ls -C`
@@ -203,6 +243,39 @@ python -m pip install --no-index --find-links . -r requirements.txt
 
 Options: `--python-versions 3.11 3.12 3.13` (which interpreter versions to fetch
 for), `--os windows macos linux` (subset), `--requirements PATH`, `--output DIR`.
+
+## Python imports (all standard library)
+
+The desktop app has **zero third-party Python dependencies** — every import below
+ships with CPython. There is no `pip install` step and no packages to vendor. (The
+only *external* things it uses are the `kubectl` and optional `openssl` **command-
+line binaries**, not Python libraries — see Prerequisites.)
+
+| Import | Stdlib? | Used for |
+|---|---|---|
+| `tkinter` (`tk`, `ttk`, `filedialog`, `messagebox`, `simpledialog`) | ✅ | The entire GUI — windows, notebook tabs, tables, dialogs, themed widgets |
+| `subprocess` | ✅ | Running the external `kubectl` and `openssl` binaries and capturing their output |
+| `shutil` | ✅ | `shutil.which()` — locating `kubectl` / `openssl` on the user's PATH |
+| `shlex` | ✅ | Splitting a `KUBECTL` override (e.g. `"sudo k3s kubectl"`) into args, respecting quotes |
+| `os` | ✅ | Reading env vars (`KUBECTL`, `KUBECONFIG`, and `KUBE_EDITOR`/`EDITOR` for live edit) |
+| `sys` | ✅ | Platform detection (`win32` → hide the console window) and `argv` |
+| `threading` | ✅ | Running kubectl/openssl on background threads so the UI never blocks |
+| `queue` | ✅ | Thread-safe handoff of results from worker threads back to the UI thread |
+| `json` | ✅ | Parsing `kubectl ... -o json` and reading/writing cached snapshots |
+| `base64` | ✅ | Decoding Secret `data` values (the Secrets decoder) |
+| `binascii` | ✅ | Catching invalid-base64 errors (`binascii.Error`) when decoding secrets |
+| `re` | ✅ | Matching PEM certificate blocks and parsing CRD printer-column JSONPaths |
+| `csv` | ✅ | Exporting any table to a CSV file |
+| `datetime` (`datetime`, `timezone`) | ✅ | Resource age and TLS-cert expiry math (days remaining / expired) |
+| `time` | ✅ | Timestamps ("updated HH:MM:SS"), Trends sample times |
+| `pathlib` (`Path`) | ✅ | Filesystem paths (data folder, trends history) |
+| `__future__` (`annotations`) | ✅ | Deferred type-annotation evaluation |
+| `kubectl_collect` | local | The project's own kubectl wrapper module |
+| `trends` | local | The project's own Trends capture + line-chart module |
+
+> The optional Streamlit web variant (`app.py`) is the *only* part that needs
+> third-party packages (`streamlit`, `pandas` in `requirements.txt`). The desktop
+> app does not import them.
 
 ## Kubernetes commands used
 

@@ -15,12 +15,37 @@ Run:
 
 Override the kubectl binary for non-standard setups:
     KUBECTL="sudo k3s kubectl" python k8s_dashboard_gui.py
+
+How this file is organized (top to bottom, follow the `# ---` banners):
+  1. Quantity parsing        — CPU/memory string <-> number helpers.
+  2. Load + shape the data    — turn raw kubectl JSON into the display `model`
+                                (build_model*, build_*_row).
+  3. GUI — main window        — the Dashboard class: control rows, sidebar nav,
+                                and the analysis tabs (Overview/Nodes/Deployments/
+                                Pods/Resource Management/Trends).
+  4. Resource detail inspector— ResourceDetailView (Describe/YAML/Events, plus
+                                Logs+Shell for pods, the secret decoder + openssl
+                                cert inspector, and child-pod lists).
+  5. Row interaction          — the shared click model (⧉ / double-click / ☑).
+  6. Generic resource browser — the Kind registry (RESOURCE_GROUPS), its row
+                                renderers, ResourceBrowser, and the CRD-discovering
+                                CustomResourceBrowser.
+
+Threading rule of thumb: kubectl never runs on the UI thread. Each screen kicks
+work onto a daemon thread that drops results on a queue.Queue, and an after()
+timer on the UI thread drains that queue to update widgets.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import json
+import os
 import queue
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -47,6 +72,7 @@ _MEM_SUFFIX = {
 
 
 def cpu_to_milli(q):
+    """A Kubernetes CPU quantity ('250m', '2', '500000n') -> millicores (float)."""
     if not q:
         return 0.0
     q = str(q).strip()
@@ -57,6 +83,7 @@ def cpu_to_milli(q):
 
 
 def mem_to_bytes(q):
+    """A Kubernetes memory quantity ('512Mi', '2Gi', '1000000') -> bytes (float)."""
     if not q:
         return 0.0
     q = str(q).strip()
@@ -67,6 +94,7 @@ def mem_to_bytes(q):
 
 
 def fmt_cpu(m):
+    """Millicores -> display string ('750m', '2.00 cores'); '—' for None."""
     if m is None:
         return "—"
     if m >= 1000:
@@ -75,6 +103,7 @@ def fmt_cpu(m):
 
 
 def fmt_mem(b):
+    """Bytes -> display string ('1.5Gi', '512.0Mi'); '—' for None."""
     if b is None:
         return "—"
     for unit, size in (("Gi", 1024**3), ("Mi", 1024**2), ("Ki", 1024)):
@@ -84,6 +113,7 @@ def fmt_mem(b):
 
 
 def pct(n, d):
+    """n/d as a rounded percent string ('83%'); '—' when the denominator is 0."""
     return f"{n/d*100:.0f}%" if d else "—"
 
 
@@ -125,9 +155,12 @@ def age_from(ts):
 
 
 # ---------------------------------------------------------------------------
-# Load + shape the data
+# Load + shape the data — turn raw kubectl JSON (live or cached files) into the
+# flat per-row dicts the tables consume. build_model*() are the entry points;
+# build_*_row() shape one node/pod/deployment each.
 # ---------------------------------------------------------------------------
 def _load(folder: Path, name: str) -> dict:
+    """Read+parse one cached JSON file from the data folder; {} if missing/bad."""
     p = folder / name
     if not p.exists():
         return {}
@@ -245,6 +278,7 @@ def node_pool_from_labels(labels: dict) -> str:
 
 
 def build_node_row(n: dict, usage=(None, None)) -> dict:
+    """One node's row dict: allocatable capacity plus optional live usage."""
     alloc = n["status"].get("allocatable", {})
     ready = next((c["status"] for c in n["status"].get("conditions", [])
                   if c["type"] == "Ready"), "?")
@@ -258,6 +292,8 @@ def build_node_row(n: dict, usage=(None, None)) -> dict:
 
 
 def build_dep_row(d: dict, used=None) -> dict:
+    """One deployment's row dict: per-pod and ×replicas requests/limits, and the
+    list of missing requests/limits (the 'missing' column)."""
     ns, name = d["metadata"]["namespace"], d["metadata"]["name"]
     replicas = d["spec"].get("replicas", 1)
     ready = d.get("status", {}).get("readyReplicas", 0)
@@ -349,10 +385,29 @@ def build_model_from_raw(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# GUI
+# GUI — main window (Dashboard): control rows, sidebar nav, and the analysis
+# tabs (Overview / Nodes / Deployments / Pods / Resource Management / Trends).
+# The grouped browser + resource-kind registry live further down.
 # ---------------------------------------------------------------------------
 class Dashboard(tk.Tk):
+    """
+    The main application window and controller.
+
+    Owns the top control rows (context picker + live refresh, offline folder
+    loader, status line), the collapsible left sidebar, and the notebook whose
+    tabs are the app's screens. Data flows in two ways:
+
+      - live:    refresh_from_cluster() shells out to kubectl on a worker thread,
+                 drops the raw JSON on _result_q, and _poll_collect() picks it up.
+      - offline: reload() reads previously-saved JSON from ``folder``.
+
+    Either way the raw JSON is turned into the display ``model`` and the analysis
+    tabs are rebuilt. Long-lived state (Trends capture, history) is kept here so
+    it survives tab rebuilds; the persistent Trends tab is never torn down.
+    """
+
     def __init__(self, folder: Path):
+        # ``folder`` is where offline JSON snapshots and the trends history live.
         super().__init__()
         self.title("☸ CULMIN8 — Manager, Inspector & Navigator for K8s")
         self.geometry("1200x760")
@@ -401,6 +456,27 @@ class Dashboard(tk.Tk):
         bar.pack(fill="x")
         self.status = ttk.Label(bar, text="")
         self.status.pack(side="left")
+
+        # --- Bottom: kubectl command buffer ("don't make me dumb") ------------
+        # Packed side=bottom BEFORE the body so it stays pinned to the window's
+        # bottom edge. It shows the kubectl command the app just ran OR the command
+        # you'd type to fetch whatever row you've highlighted — a live cheat sheet.
+        cmdbar = ttk.Frame(self, padding=(6, 2, 6, 4))
+        cmdbar.pack(side="bottom", fill="x")
+        ttk.Label(cmdbar, text="kubectl:").pack(side="left")
+        self._cmd_source = ttk.Label(cmdbar, text="", width=16, foreground="#777")
+        self._cmd_source.pack(side="left", padx=(4, 4))
+        self.cmd_var = tk.StringVar(
+            value="highlight a row or refresh — the equivalent kubectl command shows here")
+        cmd_entry = ttk.Entry(cmdbar, textvariable=self.cmd_var, state="readonly")
+        cmd_entry.pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(cmdbar, text="Copy", width=6,
+                   command=self._copy_command).pack(side="left")
+        # kubectl runs on worker threads, so executed commands arrive via a queue
+        # that the UI thread drains; selection previews call show_command directly.
+        self._cmd_disp_q: queue.Queue = queue.Queue()
+        kubectl_collect.command_listener = self._cmd_disp_q.put
+        self.after(200, self._poll_cmd_display)
 
         # --- Body: collapsible sidebar (hamburger) + notebook content -------
         # The notebook keeps driving tab content, but its top tab strip is
@@ -471,15 +547,18 @@ class Dashboard(tk.Tk):
             self._highlight_active(current)
 
     def _highlight_active(self, tab_id):
+        """Draw the sidebar button for ``tab_id`` as pressed, the rest as normal."""
         for tid, btn in self._nav_buttons.items():
             btn.state(["pressed"] if str(tid) == str(tab_id) else ["!pressed"])
 
     def _on_tab_changed(self, _event=None):
+        """Keep the sidebar highlight in sync when the notebook tab changes."""
         sel = self.nb.select()
         if sel:
             self._highlight_active(sel)
 
     def _toggle_sidebar(self):
+        """Collapse/expand the left sidebar (the ☰ hamburger)."""
         self._sidebar_open = not self._sidebar_open
         if self._sidebar_open:
             self._nav.pack(fill="both", expand=True, pady=(6, 0))
@@ -488,8 +567,41 @@ class Dashboard(tk.Tk):
             self._nav.pack_forget()
             self._sidebar_title.pack_forget()
 
+    # -- kubectl command buffer ("don't make me dumb") ---------------------
+    def _set_command(self, text, source):
+        """Show one command string in the bottom bar with a short source tag."""
+        self.cmd_var.set(text)
+        self._cmd_source.config(text=source)
+
+    def show_command(self, argv, source="selected"):
+        """Public: show the kubectl command for a highlighted row (argv list).
+
+        Any widget can call this via winfo_toplevel(), so the preview is available
+        everywhere without threading a callback through every table.
+        """
+        self._set_command(kubectl_collect.format_command(argv), f"({source})")
+
+    def _poll_cmd_display(self):
+        """Drain executed-command argv from the worker queue into the bar."""
+        last = None
+        try:
+            while True:
+                last = self._cmd_disp_q.get_nowait()
+        except queue.Empty:
+            pass
+        if last is not None:
+            self._set_command(kubectl_collect.format_command(last), "(last run)")
+        self.after(300, self._poll_cmd_display)
+
+    def _copy_command(self):
+        """Copy the currently-shown command to the clipboard."""
+        self.clipboard_clear()
+        self.clipboard_append(self.cmd_var.get())
+        self.status.config(text="✓ command copied to clipboard")
+
     # -- live cluster ------------------------------------------------------
     def load_contexts(self):
+        """Populate the context dropdown from kubeconfig; disable refresh if none."""
         contexts, current = kubectl_collect.list_contexts()
         self.context_box["values"] = contexts
         if current and current in contexts:
@@ -504,6 +616,14 @@ class Dashboard(tk.Tk):
             self.refresh_btn.state(["!disabled"])
 
     def refresh_from_cluster(self):
+        """
+        Kick off a full live pull via kubectl on a background thread.
+
+        The UI thread must never block on kubectl, so the actual collect() runs in
+        ``work()`` and hands its result (or exception) back through _result_q; the
+        _poll_collect() timer drains that queue and updates the screen. ``_busy``
+        guards against overlapping refreshes.
+        """
         if self._busy:
             return
         self._busy = True
@@ -522,6 +642,7 @@ class Dashboard(tk.Tk):
         self.after(100, self._poll_collect)
 
     def _poll_collect(self):
+        """Drain the collect worker's result queue; on success rebuild the model."""
         try:
             kind, payload = self._result_q.get_nowait()
         except queue.Empty:
@@ -542,6 +663,7 @@ class Dashboard(tk.Tk):
         self._render(source=f"context “{self.context_var.get()}”")
 
     def _save_raw(self, raw: dict):
+        """Cache the raw kubectl JSON to the data folder for offline reloads."""
         folder = Path(self.path_var.get())
         folder.mkdir(parents=True, exist_ok=True)
         names = {
@@ -553,12 +675,14 @@ class Dashboard(tk.Tk):
             (folder / fname).write_text(json.dumps(raw.get(key) or {}), encoding="utf-8")
 
     def browse(self):
+        """Pick an offline data folder, then load the JSON snapshot in it."""
         d = filedialog.askdirectory(initialdir=self.path_var.get() or ".")
         if d:
             self.path_var.set(d)
             self.reload()
 
     def reload(self):
+        """Load a previously-saved JSON snapshot from the data folder (offline mode)."""
         folder = Path(self.path_var.get())
         if not (folder / "pods.json").exists():
             self.status.config(text="⚠ no pods.json in that folder — "
@@ -568,6 +692,7 @@ class Dashboard(tk.Tk):
         self._render(source=f"files in {folder}")
 
     def _render(self, source: str = ""):
+        """Update the status summary line and rebuild every analysis tab."""
         has_metrics = any(p["cpu_used_m"] is not None for p in self.model["pods"])
         self.status.config(
             text=f"{len(self.model['nodes'])} nodes · {len(self.model['deployments'])} deploys · "
@@ -590,6 +715,7 @@ class Dashboard(tk.Tk):
         self._build_offenders_tab()
         for group in RESOURCE_GROUPS:
             self._build_group_tab(group)
+        self._build_crd_tab()
         # Keep Trends as the last tab.
         self.nb.insert("end", self._trends_frame)
         self._trends_refresh_namespaces()
@@ -601,8 +727,15 @@ class Dashboard(tk.Tk):
 
     # -- helpers -----------------------------------------------------------
     def _make_tree(self, parent, columns, widths=None):
+        """
+        Build a standard sortable/exportable table (ttk.Treeview) used by the
+        analysis tabs. Wires up: click-header-to-sort, a CSV export button plus
+        right-click "Export to CSV", and the shared red/amber row tags used to
+        flag failing/heads-up rows. Returns the Treeview.
+        """
         wrap = ttk.Frame(parent)
         wrap.pack(fill="both", expand=True)
+        # (the command-preview wiring is added by callers via _wire_cmd_preview)
 
         # Toolbar above every table with a visible export button.
         tools = ttk.Frame(wrap)
@@ -636,6 +769,25 @@ class Dashboard(tk.Tk):
         tree.bind("<Button-3>", popup)      # right-click (Win/Linux)
         tree.bind("<Button-2>", popup)      # middle/right on some macs
         return tree
+
+    def _wire_cmd_preview(self, tree, ktype, name_col, ns_col=None):
+        """
+        Show `kubectl get <ktype> <name> [-n ns] -o yaml` in the bottom bar whenever
+        a row is highlighted in ``tree``. This is the "teach me the command" hook;
+        call it once per table, naming the columns that hold the object's name/ns.
+        """
+        def on_sel(_e=None):
+            row = tree.focus()
+            if not row:
+                return
+            name = tree.set(row, name_col)
+            if not name:
+                return
+            ns = tree.set(row, ns_col) if ns_col else ""
+            argv = kubectl_collect.get_argv(
+                ktype, name, namespace=ns, context=self.context_var.get().strip())
+            self.show_command(argv, source="selected")
+        tree.bind("<<TreeviewSelect>>", on_sel, add="+")
 
     def _export_tree_csv(self, tree):
         """Write a Treeview's current columns and rows to a CSV file the user picks.
@@ -673,6 +825,13 @@ class Dashboard(tk.Tk):
         self.status.config(text=f"✓ exported {len(rows)} rows → {path}")
 
     def _sort(self, tree, col, desc):
+        """
+        Sort a table by one column, toggling direction on repeat clicks.
+
+        Values are compared numerically when possible (stripping unit suffixes
+        like %, m, Gi/Mi/Ki, " cores"), otherwise case-insensitively as text — so
+        "900m" and "2 cores" sort sensibly rather than lexically.
+        """
         data = [(tree.set(k, col), k) for k in tree.get_children("")]
 
         def key(t):
@@ -752,6 +911,7 @@ class Dashboard(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _node_usage_map(self, context):
+        """{node name -> (cpu millicores, mem bytes)} live from metrics-server."""
         nu = {}
         for it in kubectl_collect.node_metrics(context).get("items", []):
             nu[it["metadata"]["name"]] = (
@@ -761,6 +921,8 @@ class Dashboard(tk.Tk):
 
     # -- tabs --------------------------------------------------------------
     def _build_overview_tab(self):
+        """🏠 Overview: cluster totals, CPU/mem capacity vs requested vs used,
+        counts of missing limits, and the biggest memory offenders."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="🏠 Overview")
         self._analysis_frames.append(frame)
@@ -855,6 +1017,8 @@ class Dashboard(tk.Tk):
                       ).pack(anchor="w")
 
     def _build_nodes_tab(self):
+        """Nodes: requested % vs used % per node; red when >85% requested or
+        NotReady. Rows open a node's details/events and the pods it hosts."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Nodes")
         self._analysis_frames.append(frame)
@@ -895,6 +1059,7 @@ class Dashboard(tk.Tk):
                                [40, 150, 130, 70, 55, 90, 80, 80, 90, 90, 80, 90, 80, 200])
         tree.heading("open", text="⧉")
         tree.column("open", anchor="center", stretch=False)
+        self._wire_cmd_preview(tree, "nodes", "node")
 
         def refill():
             for r in tree.get_children(""):
@@ -953,6 +1118,8 @@ class Dashboard(tk.Tk):
                                            tree.set(sel, "node"), "", ctx()))
 
     def _build_deploys_tab(self):
+        """Deployments: per-pod and ×replicas reserved footprint, missing
+        requests/limits, and bulk rollout-restart / delete on checked rows."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Deployments")
         self._analysis_frames.append(frame)
@@ -1002,6 +1169,7 @@ class Dashboard(tk.Tk):
         tree.heading("open", text="⧉")
         tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
+        self._wire_cmd_preview(tree, "deployments", "deployment", "namespace")
 
         def refill(*_):
             ms.reset()
@@ -1075,6 +1243,8 @@ class Dashboard(tk.Tk):
                   "click ⧉ for a new window.", padding=4).pack(anchor="w")
 
     def _build_pods_tab(self):
+        """Pods: filterable list flagging unhealthy/restarting pods (red/amber),
+        with bulk delete and per-pod details / logs / shell on open."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Pods")
         self._analysis_frames.append(frame)
@@ -1130,6 +1300,7 @@ class Dashboard(tk.Tk):
         tree.heading("open", text="⧉")
         tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
+        self._wire_cmd_preview(tree, "pods", "pod", "namespace")
 
         def refill(*_):
             ms.reset()
@@ -1193,6 +1364,8 @@ class Dashboard(tk.Tk):
                   padding=4).pack(anchor="w")
 
     def _build_group_tab(self, group):
+        """Build one grouped browser tab (Workloads/Networking/Config/Storage/
+        Security) from RESOURCE_GROUPS[group] — see ResourceBrowser."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text=group)
         self._analysis_frames.append(frame)
@@ -1200,7 +1373,18 @@ class Dashboard(tk.Tk):
             frame, lambda: self.context_var.get().strip(), RESOURCE_GROUPS[group])
         browser.pack(fill="both", expand=True)
 
+    def _build_crd_tab(self):
+        """Custom Resources: browse instances of any CRD the cluster has installed."""
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="Custom Resources")
+        self._analysis_frames.append(frame)
+        browser = CustomResourceBrowser(
+            frame, lambda: self.context_var.get().strip())
+        browser.pack(fill="both", expand=True)
+
     def _build_offenders_tab(self):
+        """Resource Management: pods sorted worst-first by wasted memory
+        (requested − actually used) — the over-reservation this tool exists to find."""
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text="Resource Management")
         self._analysis_frames.append(frame)
@@ -1240,6 +1424,7 @@ class Dashboard(tk.Tk):
         cols = ("namespace", "pod", "node", "mem req", "mem used", "mem WASTED",
                 "cpu req", "cpu used")
         tree = self._make_tree(frame, cols, [110, 240, 150, 90, 90, 100, 80, 80])
+        self._wire_cmd_preview(tree, "pods", "pod", "namespace")
         empty = ttk.Label(frame, padding=6, text="No metrics-server data available.")
 
         def refill():
@@ -1272,6 +1457,8 @@ class Dashboard(tk.Tk):
 
     # -- Trends tab (time series) ------------------------------------------
     def _build_trends_tab(self):
+        """Trends: sample deployment CPU/mem on an interval while the app runs and
+        graph one line per deployment. This tab persists across data reloads."""
         frame = ttk.Frame(self.nb)
         self._trends_frame = frame
         self.nb.add(frame, text="Trends")
@@ -1325,6 +1512,8 @@ class Dashboard(tk.Tk):
         self._trends_redraw()
 
     def _trends_toggle_capture(self):
+        """Start/stop periodic sampling. Start takes one sample now, then schedules
+        the next on the chosen interval; stop cancels the pending timer."""
         if self._cap_running:
             self._cap_running = False
             if self._cap_after_id is not None:
@@ -1342,6 +1531,7 @@ class Dashboard(tk.Tk):
         self._capture_tick()  # take one sample immediately, then on the interval
 
     def _capture_tick(self):
+        """Take one trends sample off-thread (guarded so ticks can't overlap)."""
         if not self._cap_running or self._cap_busy:
             return
         self._cap_busy = True
@@ -1359,6 +1549,7 @@ class Dashboard(tk.Tk):
         self.after(100, self._poll_capture)
 
     def _poll_capture(self):
+        """Drain a finished sample, append it to history, redraw, then reschedule."""
         try:
             kind, payload = self._cap_q.get_nowait()
         except queue.Empty:
@@ -1383,6 +1574,7 @@ class Dashboard(tk.Tk):
             self._cap_after_id = self.after(ms, self._capture_tick)
 
     def _trends_update_status(self, extra: str = ""):
+        """Refresh the Trends status line (sample count, time span, capture state)."""
         n = len(self._history)
         times = sorted({r["ts"] for r in self._history})
         span = ""
@@ -1394,12 +1586,15 @@ class Dashboard(tk.Tk):
             text=f"{len(times)} samples · {n} records{span} · {state}{extra}")
 
     def _trends_refresh_namespaces(self):
+        """Sync the Trends namespace dropdown to whatever history we've captured."""
         namespaces = trends.namespaces_in(self._history)
         self.trends_ns_box["values"] = namespaces
         if namespaces and self.trends_ns.get() not in namespaces:
             self.trends_ns.set(namespaces[0])
 
     def _trends_redraw(self):
+        """Redraw the chart for the selected namespace/metric: one line per
+        deployment, solid = actual usage, dashed = requested."""
         if not hasattr(self, "trends_chart"):
             return
         ns = self.trends_ns.get()
@@ -1443,6 +1638,11 @@ _DIRECT_OWNER = {"statefulsets": "StatefulSet", "statefulset": "StatefulSet",
                  "jobs": "Job", "job": "Job"}
 
 
+# ---------------------------------------------------------------------------
+# Resource detail inspector — the per-object view (Describe / YAML / Events, and
+# for pods Logs + Shell, for secrets the decoder + cert inspector, for
+# controllers/nodes their Pods). Plus the openssl helpers it uses for TLS certs.
+# ---------------------------------------------------------------------------
 def pods_for(ktype, name, namespace, context):
     """Live-query the pods a controller owns, or the pods running on a node."""
     if ktype in ("nodes", "node"):
@@ -1465,6 +1665,166 @@ def pods_for(ktype, name, namespace, context):
                 if any(o.get("kind") == owner and o.get("name") == name
                        for o in p["metadata"].get("ownerReferences", []))]
     return []
+
+
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+_PEM_CERT_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+    re.DOTALL)
+
+
+def openssl_available():
+    """True if an `openssl` binary is on PATH (the cert features shell out to it)."""
+    return shutil.which("openssl") is not None
+
+
+def openssl_missing_message():
+    """Friendly, per-OS guidance shown when the openssl binary can't be found."""
+    if sys.platform == "win32":
+        how = ("Install it (e.g. `winget install ShiningLight.OpenSSL` or "
+               "`choco install openssl`), or if you have Git for Windows it ships "
+               "one at C:\\Program Files\\Git\\usr\\bin — add that to PATH.")
+    elif sys.platform == "darwin":
+        how = "Install it with `brew install openssl` and make sure it's on PATH."
+    else:
+        how = ("Install it with your package manager (e.g. `sudo apt install openssl` "
+               "or `sudo dnf install openssl`).")
+    return ("⚠ openssl was not found on your PATH.\n\n"
+            "Certificate inspection shells out to the openssl command-line tool "
+            "(no Python crypto library is used), so it needs that binary.\n\n"
+            + how)
+
+
+def _run_openssl(args, stdin_text=""):
+    """
+    Run `openssl <args>`, feeding stdin_text as the input PEM. -> (out, err).
+
+    Never raises: a missing binary, a failed exec, or a timeout all come back as
+    ("", <human message>) so callers can just display ``err``.
+    """
+    if not openssl_available():
+        return "", openssl_missing_message()
+    try:
+        proc = subprocess.run(["openssl"] + args, input=stdin_text, text=True,
+                              capture_output=True, timeout=20, creationflags=_NO_WINDOW)
+    except FileNotFoundError as e:
+        # PATH said openssl exists but exec failed (race, or a broken shim).
+        return "", f"could not run openssl: {e}\n\n{openssl_missing_message()}"
+    except subprocess.TimeoutExpired:
+        return "", "openssl timed out after 20s."
+    except OSError as e:  # permissions, bad executable, etc.
+        return "", f"could not run openssl: {e}"
+    return proc.stdout, proc.stderr.strip()
+
+
+def _split_pem_certs(text):
+    """Every PEM CERTIFICATE block in a bundle (leaf first, as stored)."""
+    return _PEM_CERT_RE.findall(text or "")
+
+
+def _is_cert_pem(text):
+    return "-----BEGIN CERTIFICATE-----" in (text or "")
+
+
+def _cert_chain_summary(pem_bundle):
+    """
+    Human summary of a cert bundle: per-cert subject/issuer/validity + expiry
+    status, plus a naive linkage check (issuer[i] == subject[i+1]). Uses openssl
+    to read each field so it works without any Python TLS libs.
+    """
+    certs = _split_pem_certs(pem_bundle)
+    if not certs:
+        return "No PEM CERTIFICATE blocks found."
+    if not openssl_available():
+        return openssl_missing_message()
+
+    lines = [f"{len(certs)} certificate(s) in bundle (leaf first):\n"]
+    subjects, issuers = [], []
+    now = datetime.now(timezone.utc)
+    for i, cert in enumerate(certs):
+        out, err = _run_openssl(
+            ["x509", "-noout", "-subject", "-issuer", "-dates",
+             "-nameopt", "RFC2253"], cert)
+        fields = {}
+        for ln in out.splitlines():
+            k, _, v = ln.partition("=")
+            if _:
+                fields[k.strip()] = v.strip()
+        subj = fields.get("subject", "?")
+        iss = fields.get("issuer", "?")
+        subjects.append(subj)
+        issuers.append(iss)
+        expiry = fields.get("notAfter", "")
+        exp_note = ""
+        try:
+            # openssl prints e.g. "Jun 11 12:00:00 2026 GMT"
+            dt = datetime.strptime(expiry, "%b %d %H:%M:%S %Y %Z").replace(
+                tzinfo=timezone.utc)
+            days = (dt - now).days
+            exp_note = (f"  ⚠ EXPIRED {-days}d ago" if days < 0
+                        else f"  ({days}d left)" + (" ⚠ soon" if days < 30 else ""))
+        except ValueError:
+            pass
+        lines.append(f"[{i}] {'leaf' if i == 0 else 'intermediate/root'}")
+        lines.append(f"    subject: {subj}")
+        lines.append(f"    issuer : {iss}")
+        lines.append(f"    valid  : {fields.get('notBefore','?')}  ->  "
+                     f"{expiry}{exp_note}")
+        if err:
+            lines.append(f"    (openssl: {err})")
+        lines.append("")
+
+    # Linkage: does each cert's issuer match the next cert's subject?
+    lines.append("Chain linkage:")
+    if len(certs) == 1:
+        lines.append("  single cert — no intermediates bundled "
+                     "(clients may need the issuer separately).")
+    else:
+        for i in range(len(certs) - 1):
+            ok = issuers[i] == subjects[i + 1]
+            lines.append(f"  [{i}]→[{i+1}] {'OK' if ok else '⚠ MISMATCH'}: "
+                         f"issuer of [{i}] vs subject of [{i+1}]")
+    if issuers and subjects and issuers[-1] == subjects[-1]:
+        lines.append("  last cert is self-signed (root).")
+    return "\n".join(lines)
+
+
+def launch_in_terminal(argv, title="kubectl"):
+    """
+    Open a NEW terminal window running ``argv`` and return (ok, message).
+
+    Used for interactive kubectl subcommands (edit) that need a real TTY + the
+    user's editor. We don't capture output — the point is to hand control to the
+    terminal exactly like running the command yourself. Best-effort per OS:
+      - Windows: a new console via `start` + `cmd /k` (stays open to show result).
+      - macOS:   Terminal.app via AppleScript `do script`.
+      - Linux:   the first available terminal emulator that accepts `-e`.
+    """
+    try:
+        if sys.platform == "win32":
+            # `start "" cmd /k <argv>` — empty title arg, /k keeps the window up.
+            subprocess.Popen(["cmd", "/c", "start", title, "cmd", "/k", *argv])
+            return True, "opened a new console window"
+        if sys.platform == "darwin":
+            cmd = " ".join(shlex.quote(a) for a in argv)
+            script = (f'tell application "Terminal" to do script "{cmd}"\n'
+                      'tell application "Terminal" to activate')
+            subprocess.Popen(["osascript", "-e", script])
+            return True, "opened Terminal.app"
+        # Linux / other unix: try known terminal emulators in order.
+        cmd = " ".join(shlex.quote(a) for a in argv)
+        for term in ("x-terminal-emulator", "gnome-terminal", "konsole",
+                     "xfce4-terminal", "xterm"):
+            if shutil.which(term):
+                if term == "gnome-terminal":
+                    subprocess.Popen([term, "--", "bash", "-lc", cmd])
+                else:
+                    subprocess.Popen([term, "-e", f"bash -lc {shlex.quote(cmd)}"])
+                return True, f"opened {term}"
+        return False, ("no terminal emulator found (tried x-terminal-emulator, "
+                       "gnome-terminal, konsole, xfce4-terminal, xterm).")
+    except OSError as e:
+        return False, f"could not open a terminal: {e}"
 
 
 class ResourceDetailView(ttk.Frame):
@@ -1497,8 +1857,12 @@ class ResourceDetailView(ttk.Frame):
         # child-pods ("what it deploys" / "pods on node") plumbing
         self._pods_q: queue.Queue = queue.Queue()
         self._rpods_rows = {}
+        # secret-decoder plumbing
+        self._secret_q: queue.Queue = queue.Queue()
+        self._sec_data = {}           # key -> stored base64 string
 
         is_pod = kind in ("pod", "pods", "po")
+        is_secret = kind in ("secret", "secrets")
         nsargs = ["-n", namespace] if namespace else []
         crumb = (f"{namespace} / " if namespace else "") + f"{kind}/{name}"
 
@@ -1507,6 +1871,9 @@ class ResourceDetailView(ttk.Frame):
         if on_back is not None:
             ttk.Button(header, text="← Back", command=on_back).pack(side="left")
         ttk.Label(header, text=f"  {crumb}", font=("", 10, "bold")).pack(side="left")
+        # Live edit: hand off to `kubectl edit` in a real terminal (see _launch_edit).
+        ttk.Button(header, text="✎ Edit (kubectl edit)",
+                   command=self._launch_edit).pack(side="right")
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -1521,12 +1888,47 @@ class ResourceDetailView(ttk.Frame):
             self._build_logs_tab(nb)
             self._build_exec_tab(nb, "sh")
             self._build_exec_tab(nb, "bash")
+        elif is_secret:
+            self._build_secret_tab(nb)
         elif kind in _HAS_PODS:
             self._build_resource_pods_tab(nb)
 
         self._after_ids.append(self.after(100, self._poll_cmd))
+        if is_secret:
+            self._after_ids.append(self.after(120, self._poll_secret))
         # If the frame is destroyed out from under us (e.g. tab rebuild), clean up.
         self.bind("<Destroy>", lambda e: self.teardown() if e.widget is self else None)
+
+    # -- live edit (hand off to `kubectl edit`) ----------------------------
+    def _launch_edit(self):
+        """
+        Open `kubectl edit <kind>/<name>` in a new terminal window.
+
+        Deliberately NOT a built-in YAML editor: kubectl edit already does the hard
+        parts (server-side validation, optimistic concurrency, applying on save)
+        using the user's own $KUBE_EDITOR/$EDITOR. We just launch it in a real
+        terminal so that whole flow happens, triggered from the GUI.
+        """
+        if kubectl_collect.kubectl_path() is None:
+            messagebox.showerror("kubectl not found",
+                                 "kubectl must be on your PATH (or set KUBECTL) to edit.")
+            return
+        editor = os.environ.get("KUBE_EDITOR") or os.environ.get("EDITOR") \
+            or ("notepad" if sys.platform == "win32" else "the system default")
+        if not messagebox.askyesno(
+                "Edit in terminal",
+                f"Open `kubectl edit {self.kind}/{self.name}`"
+                + (f" -n {self.namespace}" if self.namespace else "")
+                + " in a new terminal window?\n\n"
+                f"It will use your editor ({editor}). Saving in that editor applies "
+                "the change to the cluster; quitting without saving cancels.\n\n"
+                "Click ⟳ Refresh on a tab afterward to see the result."):
+            return
+        argv = kubectl_collect.edit_argv(
+            self.kind, self.name, namespace=self.namespace, context=self.context)
+        ok, msg = launch_in_terminal(argv, title=f"edit {self.kind}/{self.name}")
+        if not ok:
+            messagebox.showerror("Could not open a terminal", msg)
 
     # -- describe / get (refreshable snapshots) ----------------------------
     def _build_cmd_tab(self, nb, title, args):
@@ -1581,8 +1983,216 @@ class ResourceDetailView(ttk.Frame):
             pass
         self._after_ids.append(self.after(150, self._poll_cmd))
 
+    # -- secret decoder ("Get secret") -------------------------------------
+    def _build_secret_tab(self, nb):
+        """
+        A Secret-only tab: lists each data key with its value hidden by default,
+        a decoder (Base64 first, extensible), plus reveal/copy per key. Kept
+        separate from YAML so values aren't exposed until you ask for them.
+        """
+        frame = ttk.Frame(nb)
+        nb.add(frame, text="Get secret")
+
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Decoder:").pack(side="left")
+        self._sec_decoder = tk.StringVar(value="Base64")
+        cb = ttk.Combobox(bar, textvariable=self._sec_decoder, width=14, state="readonly",
+                          values=["Base64", "Raw (stored base64)"])
+        cb.pack(side="left", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._render_secret())
+        self._sec_reveal = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Reveal values", variable=self._sec_reveal,
+                        command=self._render_secret).pack(side="left", padx=8)
+        ttk.Button(bar, text="⟳ Refresh", command=self._load_secret).pack(side="left")
+        self._sec_status = ttk.Label(bar, text="")
+        self._sec_status.pack(side="left", padx=8)
+        self._sec_type = ttk.Label(bar, text="", foreground="#555")
+        self._sec_type.pack(side="right")
+
+        # Scrollable body: one block per data key.
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(wrap, highlightthickness=0)
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        self._sec_body = ttk.Frame(canvas)
+        self._sec_body.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._sec_win = canvas.create_window((0, 0), window=self._sec_body, anchor="nw")
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(self._sec_win, width=e.width))
+        canvas.configure(yscrollcommand=vs.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+
+        self._load_secret()
+
+    def _load_secret(self):
+        self._sec_status.config(text="⏳ loading…")
+        args = ["get", self.kind, self.name] \
+            + (["-n", self.namespace] if self.namespace else []) + ["-o", "json"]
+
+        def work():
+            try:
+                out = kubectl_collect.run_text(args, context=self.context)
+                self._secret_q.put((json.loads(out), None))
+            except Exception as e:  # noqa: BLE001 — surfaced in the tab
+                self._secret_q.put((None, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_secret(self):
+        if self._torn:
+            return
+        try:
+            while True:
+                obj, err = self._secret_q.get_nowait()
+                if err is not None:
+                    self._sec_status.config(text=f"⚠ {err}")
+                    self._sec_data = {}
+                else:
+                    self._sec_data = obj.get("data", {}) or {}
+                    self._sec_type.config(text=f"type: {obj.get('type', '')}")
+                    self._sec_status.config(
+                        text=f"{len(self._sec_data)} keys · "
+                             f"loaded {time.strftime('%H:%M:%S')}")
+                self._render_secret()
+        except queue.Empty:
+            pass
+        self._after_ids.append(self.after(200, self._poll_secret))
+
+    def _decode_secret(self, b64):
+        """Apply the selected decoder to one stored (base64) value -> display text."""
+        if self._sec_decoder.get().startswith("Raw"):
+            return b64
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            return "⚠ not valid base64"
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"⟪binary: {len(raw)} bytes⟫\n{raw.hex()}"
+
+    def _decoded_text(self, b64):
+        """base64 -> utf-8 text, or '' if it isn't decodable text (e.g. a DER blob)."""
+        try:
+            return base64.b64decode(b64, validate=True).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return ""
+
+    def _copy_secret(self, b64):
+        self.clipboard_clear()
+        self.clipboard_append(self._decode_secret(b64))
+        self._sec_status.config(text="copied to clipboard")
+
+    # openssl views offered for a cert; label -> openssl args (PEM fed on stdin).
+    _CERT_VIEWS = {
+        "Chain summary": None,          # special-cased (Python + openssl per cert)
+        "Full text": ["x509", "-noout", "-text"],
+        "Dates (expiry)": ["x509", "-noout", "-dates"],
+        "Subject / Issuer": ["x509", "-noout", "-subject", "-issuer",
+                             "-nameopt", "RFC2253"],
+        "Subject Alt Names": ["x509", "-noout", "-ext", "subjectAltName"],
+        "Fingerprint (SHA-256)": ["x509", "-noout", "-fingerprint", "-sha256"],
+        "Serial": ["x509", "-noout", "-serial"],
+    }
+
+    def _inspect_cert(self, key, pem):
+        """Open a window of openssl views over a cert (or bundle) from a secret key."""
+        win = tk.Toplevel(self)
+        win.title(f"TLS cert — {self.name}/{key}")
+        win.geometry("820x620")
+
+        bar = ttk.Frame(win, padding=4)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="View:").pack(side="left")
+        view_var = tk.StringVar(value="Chain summary")
+        cb = ttk.Combobox(bar, textvariable=view_var, width=22, state="readonly",
+                          values=list(self._CERT_VIEWS))
+        cb.pack(side="left", padx=4)
+        refresh_btn = ttk.Button(bar, text="⟳ Refresh")
+        refresh_btn.pack(side="left")
+        status = ttk.Label(bar, text="")
+        status.pack(side="left", padx=8)
+
+        wrap = ttk.Frame(win)
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, wrap="none", font=("Consolas", 9),
+                      background="#111", foreground="#ddd")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        hs = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        hs.pack(fill="x")
+
+        def render(*_):
+            view = view_var.get()
+            txt.delete("1.0", "end")
+            if view == "Chain summary":
+                out = _cert_chain_summary(pem)
+            else:
+                # x509 reads the first cert on stdin; that's the leaf.
+                out, err = _run_openssl(self._CERT_VIEWS[view], pem)
+                if err and not out:
+                    out = err
+            txt.insert("1.0", out)
+            status.config(text=f"{len(_split_pem_certs(pem))} cert(s) in this key")
+
+        # Without openssl there's nothing these controls can do — disable them and
+        # show the install guidance up front instead of letting the user click into
+        # dead buttons.
+        if not openssl_available():
+            cb.state(["disabled"])
+            refresh_btn.state(["disabled"])
+            status.config(text="⚠ openssl not on PATH")
+            txt.insert("1.0", openssl_missing_message())
+            return
+
+        cb.bind("<<ComboboxSelected>>", render)
+        refresh_btn.config(command=render)
+        render()
+
+    def _render_secret(self):
+        if self._torn or not hasattr(self, "_sec_body"):
+            return
+        for w in self._sec_body.winfo_children():
+            w.destroy()
+        if not self._sec_data:
+            ttk.Label(self._sec_body, text="(no data keys)",
+                      padding=8).pack(anchor="w")
+            return
+        reveal = self._sec_reveal.get()
+        for key in sorted(self._sec_data):
+            b64 = self._sec_data[key]
+            block = ttk.Frame(self._sec_body, padding=(8, 6))
+            block.pack(fill="x", expand=True)
+            head = ttk.Frame(block)
+            head.pack(fill="x")
+            ttk.Label(head, text=key, font=("", 10, "bold")).pack(side="left")
+            ttk.Button(head, text="Copy", width=6,
+                       command=lambda v=b64: self._copy_secret(v)).pack(side="right")
+            # Offer openssl inspection when the value is a PEM certificate.
+            pem = self._decoded_text(b64)
+            if _is_cert_pem(pem):
+                ttk.Button(head, text="🔎 Inspect cert",
+                           command=lambda k=key, p=pem: self._inspect_cert(k, p)
+                           ).pack(side="right", padx=4)
+            value = self._decode_secret(b64) if reveal else "•" * 24 + "  (hidden)"
+            lines = value.count("\n") + 1
+            txt = tk.Text(block, height=min(max(lines, 1), 12), wrap="char",
+                          font=("Consolas", 9), background="#111", foreground="#ddd")
+            txt.insert("1.0", value)
+            txt.configure(state="disabled")
+            txt.pack(fill="x", expand=True, pady=(2, 0))
+            ttk.Separator(self._sec_body, orient="horizontal").pack(fill="x")
+
     # -- live logs ---------------------------------------------------------
     def _build_logs_tab(self, nb):
+        """Pods only: a live `kubectl logs -f` stream with pause/restart/clear
+        and auto-scroll. A reader thread feeds _log_q; _pump_logs drains it."""
         frame = ttk.Frame(nb)
         nb.add(frame, text="Logs (live)")
         bar = ttk.Frame(frame, padding=4)
@@ -1609,6 +2219,7 @@ class ResourceDetailView(ttk.Frame):
         self._pump_logs()
 
     def _start_logs(self):
+        """Spawn `kubectl logs -f` and a reader thread that pushes lines to _log_q."""
         try:
             self._log_proc = kubectl_collect.popen_logs(
                 self.namespace, self.pod, context=self.context)
@@ -1630,6 +2241,8 @@ class ResourceDetailView(ttk.Frame):
         threading.Thread(target=reader, args=(self._log_proc,), daemon=True).start()
 
     def _pump_logs(self):
+        """UI-thread timer: move buffered log lines into the Text widget (unless
+        paused) and auto-scroll. Reschedules itself every 200ms."""
         if self._torn:
             return
         appended = False
@@ -1661,6 +2274,7 @@ class ResourceDetailView(ttk.Frame):
         self._log_proc = None
 
     def _restart_logs(self):
+        """Stop the current stream, clear the pane and queue, and start fresh."""
         self._stop_logs()
         self._clear_logs()
         try:
@@ -1672,6 +2286,8 @@ class ResourceDetailView(ttk.Frame):
 
     # -- child pods ("what it deploys" / "pods on node") -------------------
     def _build_resource_pods_tab(self, nb):
+        """For controllers/nodes: a table of the pods they own/host (see pods_for),
+        each double-clickable to open its own detail window."""
         frame = ttk.Frame(nb)
         label = "Pods on node" if self.kind in ("nodes", "node") else "Pods"
         nb.add(frame, text=label)
@@ -1744,6 +2360,8 @@ class ResourceDetailView(ttk.Frame):
 
     # -- embedded shell (kubectl exec -i) ----------------------------------
     def _build_exec_tab(self, nb, shell):
+        """Pods only: a line-oriented pipe terminal via `kubectl exec -i -- <shell>`.
+        Each shell (sh/bash) gets its own ``st`` state so they don't collide."""
         frame = ttk.Frame(nb)
         nb.add(frame, text=f"Shell: {shell}")
 
@@ -1784,6 +2402,7 @@ class ResourceDetailView(ttk.Frame):
         self._exec_pump(st)
 
     def _exec_start(self, shell, st):
+        """(Re)connect the shell: spawn `kubectl exec -i` and a reader thread."""
         self._terminate(st["proc"])
         try:
             proc = kubectl_collect.popen_exec(
@@ -1807,6 +2426,7 @@ class ResourceDetailView(ttk.Frame):
         threading.Thread(target=reader, args=(proc,), daemon=True).start()
 
     def _exec_send(self, shell, st, entry):
+        """Write one entered command line to the shell's stdin (echoing it)."""
         cmd = entry.get()
         proc = st["proc"]
         if proc is None or proc.poll() is not None:
@@ -1822,6 +2442,7 @@ class ResourceDetailView(ttk.Frame):
         entry.delete(0, "end")
 
     def _exec_pump(self, st):
+        """UI-thread timer: flush this shell's buffered output into its Text pane."""
         if self._torn:
             return
         appended = False
@@ -1841,6 +2462,7 @@ class ResourceDetailView(ttk.Frame):
 
     # -- lifecycle ---------------------------------------------------------
     def _terminate(self, proc):
+        """Best-effort terminate() of a child process (logs/exec) if still running."""
         if proc and proc.poll() is None:
             try:
                 proc.terminate()
@@ -1848,6 +2470,11 @@ class ResourceDetailView(ttk.Frame):
                 pass
 
     def teardown(self):
+        """Cancel every scheduled timer and kill every child process we own.
+
+        Called when the view is destroyed (window closed or tabs rebuilt) so no
+        orphaned kubectl logs/exec processes or after() callbacks leak.
+        """
         if self._torn:
             return
         self._torn = True
@@ -1876,6 +2503,10 @@ class ResourceDetailWindow(tk.Toplevel):
         self.destroy()
 
 
+# ---------------------------------------------------------------------------
+# Row interaction — the shared click model for every table: ⧉ opens a detail
+# window, double-click opens it in-place, and ☑ multi-select for bulk actions.
+# ---------------------------------------------------------------------------
 def wire_row_actions(tree, on_open_window, on_open_inplace):
     """
     Standard row interaction: the leading ⧉ column (single-click) opens a new
@@ -1992,7 +2623,8 @@ class Kind:
     """One resource type: how to list it, its columns, and what actions it allows."""
 
     def __init__(self, label, ktype, namespaced, columns, row, *,
-                 scalable=False, restartable=False, deletable=True):
+                 scalable=False, restartable=False, deletable=True,
+                 ns_by_subject=False):
         self.label = label
         self.ktype = ktype            # kubectl resource type (e.g. "deployments")
         self.namespaced = namespaced
@@ -2001,8 +2633,15 @@ class Kind:
         self.scalable = scalable
         self.restartable = restartable
         self.deletable = deletable
+        # Cluster-scoped kinds (e.g. ClusterRoleBindings) that can still be filtered
+        # by the namespace of their .subjects, client-side.
+        self.ns_by_subject = ns_by_subject
 
 
+# Row renderers: one `_<kind>_row(item)` per resource type. Each takes a single
+# kubectl item dict and returns the list of cell strings for that Kind's table,
+# in the SAME order as the Kind's `columns` tuple (see RESOURCE_GROUPS below).
+# Keep the two in sync when adding/removing a column.
 def _pod_row(it):
     st = it.get("status", {})
     cs = st.get("containerStatuses", [])
@@ -2113,6 +2752,47 @@ def _sc_row(it):
             it.get("reclaimPolicy", ""), _row_age(it)]
 
 
+def _sa_row(it):
+    # secrets + imagePullSecrets are separate lists; automount defaults to true.
+    n_secrets = len(it.get("secrets", []) or [])
+    automount = it.get("automountServiceAccountToken")
+    automount_s = "true" if automount is None else str(bool(automount)).lower()
+    return [_meta(it)["name"], str(n_secrets), automount_s, _row_age(it)]
+
+
+def _rules_summary(rules):
+    """Compact 'N rules' with a ⚠ marker when any rule uses a wildcard verb/resource."""
+    rules = rules or []
+    wild = any("*" in (r.get("verbs") or []) or "*" in (r.get("resources") or [])
+               for r in rules)
+    return f"{len(rules)}{' ⚠*' if wild else ''}"
+
+
+def _role_row(it):
+    return [_meta(it)["name"], _rules_summary(it.get("rules")), _row_age(it)]
+
+
+def _subjects_summary(subjects):
+    """e.g. 'ServiceAccount:default/foo, User:alice' (truncated)."""
+    parts = []
+    for s in subjects or []:
+        ns = s.get("namespace")
+        nm = s.get("name", "?")
+        parts.append(f'{s.get("kind","?")}:{ns + "/" if ns else ""}{nm}')
+    text = ", ".join(parts) if parts else "—"
+    return text if len(text) <= 60 else text[:57] + "…"
+
+
+def _rolebinding_row(it):
+    ref = it.get("roleRef", {})
+    return [_meta(it)["name"], f'{ref.get("kind","?")}/{ref.get("name","?")}',
+            _subjects_summary(it.get("subjects")), _row_age(it)]
+
+
+# The registry that drives the grouped browser tabs. Each key becomes a sidebar
+# tab (Workloads/Networking/Config/Storage/Security), and its list of Kind()s
+# populates that tab's "Type" dropdown. To expose a new resource type, add a Kind
+# here (and a matching `_<kind>_row` renderer) — no other wiring needed.
 RESOURCE_GROUPS = {
     "Workloads": [
         Kind("Deployments", "deployments", True,
@@ -2154,6 +2834,20 @@ RESOURCE_GROUPS = {
         Kind("Secrets", "secrets", True,
              [("name", 320), ("type", 200), ("data keys", 100), ("age", 80)], _secret_row),
     ],
+    "Security / RBAC": [
+        Kind("ServiceAccounts", "serviceaccounts", True,
+             [("name", 300), ("secrets", 80), ("automount", 90), ("age", 80)], _sa_row),
+        Kind("Roles", "roles", True,
+             [("name", 340), ("rules", 90), ("age", 80)], _role_row),
+        Kind("RoleBindings", "rolebindings", True,
+             [("name", 280), ("role ref", 200), ("subjects", 320), ("age", 80)],
+             _rolebinding_row),
+        Kind("ClusterRoles", "clusterroles", False,
+             [("name", 380), ("rules", 90), ("age", 80)], _role_row),
+        Kind("ClusterRoleBindings", "clusterrolebindings", False,
+             [("name", 300), ("role ref", 200), ("subjects", 320), ("age", 80)],
+             _rolebinding_row, ns_by_subject=True),
+    ],
     "Storage": [
         Kind("PersistentVolumeClaims", "persistentvolumeclaims", True,
              [("name", 260), ("status", 90), ("volume", 220), ("capacity", 90),
@@ -2190,11 +2884,11 @@ class ResourceBrowser(ttk.Frame):
         bar = ttk.Frame(self._list, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="Type:").pack(side="left")
-        self.kind_var = tk.StringVar(value=kinds[0].label)
-        kb = ttk.Combobox(bar, textvariable=self.kind_var, width=22, state="readonly",
-                          values=[k.label for k in kinds])
-        kb.pack(side="left", padx=4)
-        kb.bind("<<ComboboxSelected>>", lambda e: self._reload())
+        self.kind_var = tk.StringVar(value=kinds[0].label if kinds else "")
+        self.kind_box = ttk.Combobox(bar, textvariable=self.kind_var, width=30,
+                                     state="readonly", values=[k.label for k in kinds])
+        self.kind_box.pack(side="left", padx=4)
+        self.kind_box.bind("<<ComboboxSelected>>", lambda e: self._reload())
 
         ttk.Label(bar, text="Namespace:").pack(side="left", padx=(10, 0))
         self.ns_var = tk.StringVar(value="(all)")
@@ -2221,25 +2915,44 @@ class ResourceBrowser(ttk.Frame):
         self._table.pack(fill="both", expand=True)
 
         self.after(120, self._poll)
-        self._reload()
+        if kinds:
+            self._reload()
+
+    def set_kinds(self, kinds):
+        """Replace the browsable types at runtime (used for discovered CRDs)."""
+        self._kinds = {k.label: k for k in kinds}
+        self.kind_box["values"] = [k.label for k in kinds]
+        if kinds and self.kind_var.get() not in self._kinds:
+            self.kind_var.set(kinds[0].label)
+        if kinds:
+            self._reload()
 
     def _cur_kind(self):
+        """The Kind currently selected in the Type dropdown."""
         return self._kinds[self.kind_var.get()]
 
     def _reload(self):
+        """
+        Re-list the selected type off-thread and enable the action buttons/namespace
+        box appropriate to it. Namespaced kinds scope the query with -n/-A; cluster-
+        scoped kinds list everything (ns_by_subject ones are filtered later in _fill).
+        """
         if not self._alive:
             return
         kind = self._cur_kind()
-        self.ns_box.state(["!disabled"] if kind.namespaced else ["disabled"])
+        can_ns_filter = kind.namespaced or kind.ns_by_subject
+        self.ns_box.state(["!disabled"] if can_ns_filter else ["disabled"])
         self.scale_btn.state(["!disabled"] if kind.scalable else ["disabled"])
         self.restart_btn.state(["!disabled"] if kind.restartable else ["disabled"])
         self.delete_btn.state(["!disabled"] if kind.deletable else ["disabled"])
         self.status.config(text="⏳ loading…")
         ctx = self._get_context()
         ns = self.ns_var.get()
+        # Cluster-scoped kinds always list everything; ns_by_subject kinds are
+        # filtered client-side in _fill. Only truly namespaced kinds scope the query.
         want_ns = ns if (kind.namespaced and ns != "(all)") else ""
         all_ns = kind.namespaced and ns == "(all)"
-        need_ns_list = kind.namespaced and self._namespaces == ["(all)"]
+        need_ns_list = can_ns_filter and self._namespaces == ["(all)"]
 
         def work():
             try:
@@ -2255,6 +2968,8 @@ class ResourceBrowser(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _poll(self):
+        """UI-thread timer draining the worker queue: fill the table, refresh the
+        namespace list, or show an error/action-result status."""
         if not self._alive:
             return
         try:
@@ -2274,9 +2989,18 @@ class ResourceBrowser(ttk.Frame):
         self.after(200, self._poll)
 
     def _fill(self, kind, items):
+        """Rebuild the table for ``items``: a leading ⧉ open column, an optional
+        namespace column, then the Kind's own columns; wire row open actions."""
         for w in self._table.winfo_children():
             w.destroy()
         self._rows = {}
+
+        # Cluster-scoped bindings: filter client-side by the namespace of a subject.
+        ns_sel = self.ns_var.get()
+        if kind.ns_by_subject and ns_sel != "(all)":
+            items = [it for it in items
+                     if any(s.get("namespace") == ns_sel
+                            for s in (it.get("subjects") or []))]
         headers = ["open"] + (["namespace"] if kind.namespaced else []) \
             + [h for h, _ in kind.columns]
         widths = [40] + ([120] if kind.namespaced else []) \
@@ -2303,20 +3027,39 @@ class ResourceBrowser(ttk.Frame):
         self.status.config(text=f"{len(items)} {kind.label.lower()}")
 
         wire_row_actions(tree, self._open_window_for, self._open_inplace_for)
+        tree.bind("<<TreeviewSelect>>", lambda e: self._preview_command(), add="+")
+
+    def _preview_command(self):
+        """Show `kubectl get <type> <name> …` for the highlighted row in the app's
+        bottom command bar (found via the toplevel), if it exposes show_command."""
+        iid = self._tree.focus() if self._tree else None
+        if not iid or iid not in self._rows:
+            return
+        top = self.winfo_toplevel()
+        if not hasattr(top, "show_command"):
+            return
+        kind = self._cur_kind()
+        name, ns = self._rows[iid]
+        argv = kubectl_collect.get_argv(
+            kind.ktype, name, namespace=ns, context=self._get_context())
+        top.show_command(argv, source="selected")
 
     def _row_target(self, iid):
+        """(Kind, name, namespace) for a row iid, or None if it's unknown."""
         if iid not in self._rows:
             return None
         name, ns = self._rows[iid]
         return self._cur_kind(), name, ns
 
     def _open_window_for(self, iid):
+        """Open a row's detail in a separate window (the ⧉ column action)."""
         t = self._row_target(iid)
         if t:
             kind, name, ns = t
             ResourceDetailWindow(self, kind.ktype, name, ns, self._get_context())
 
     def _open_inplace_for(self, iid):
+        """Open a row's detail in-place, hiding the list (double-click action)."""
         t = self._row_target(iid)
         if not t:
             return
@@ -2325,6 +3068,7 @@ class ResourceBrowser(ttk.Frame):
             self, self._list, kind.ktype, name, ns, self._get_context())
 
     def _selection(self):
+        """(Kind, name, namespace) for the focused row, prompting if none is selected."""
         if not self._tree:
             return None
         iid = self._tree.focus()
@@ -2335,6 +3079,7 @@ class ResourceBrowser(ttk.Frame):
         return self._cur_kind(), name, ns
 
     def _do_scale(self):
+        """Prompt for a replica count and scale the selected workload."""
         sel = self._selection()
         if not sel:
             return
@@ -2348,6 +3093,7 @@ class ResourceBrowser(ttk.Frame):
             f"scaled {name} to {n}")
 
     def _do_restart(self):
+        """Confirm, then rollout-restart the selected workload."""
         sel = self._selection()
         if not sel:
             return
@@ -2360,6 +3106,7 @@ class ResourceBrowser(ttk.Frame):
             f"restarted {name}")
 
     def _do_delete(self):
+        """Confirm (with a warning), then delete the selected resource."""
         sel = self._selection()
         if not sel:
             return
@@ -2374,6 +3121,7 @@ class ResourceBrowser(ttk.Frame):
             f"deleted {name}")
 
     def _run_action(self, fn, ok_msg):
+        """Run a mutating action off-thread, report via the queue, then reload."""
         self.status.config(text="⏳ working…")
 
         def work():
@@ -2386,6 +3134,180 @@ class ResourceBrowser(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
         # reload shortly after so the table reflects the change
         self.after(600, self._reload)
+
+
+def _status_hint(it):
+    """
+    Best-effort state for a CRD that declares no additionalPrinterColumns: peek at
+    the common status conventions (Ready condition, phase, Argo health).
+    """
+    st = it.get("status", {}) or {}
+    conds = st.get("conditions")
+    if isinstance(conds, list) and conds:
+        ready = next((c for c in conds if c.get("type") == "Ready"), None)
+        c = ready or conds[-1]
+        return f'{c.get("type","")}={c.get("status","")}'.strip("=")
+    if isinstance(st.get("phase"), str):
+        return st["phase"]
+    if isinstance(st.get("health"), dict):
+        return st["health"].get("status", "")
+    return ""
+
+
+# A single JSONPath step: a key optionally followed by [N], [*], or [?(@.k=="v")].
+_JP_STEP = re.compile(
+    r'([^.\[]*)'                                        # key (may be empty)
+    r'(?:\[(?:(\d+)|(\*)|\?\(@\.([^=]+)==["\']([^"\']*)["\']\))\])?')
+
+
+def _jp_split(path):
+    """Split a JSONPath on '.' but never inside [...] (filters contain '@.type')."""
+    steps, buf, depth = [], [], 0
+    for ch in path.lstrip('.'):
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+        if ch == '.' and depth == 0:
+            steps.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        steps.append(''.join(buf))
+    return steps
+
+
+def _jsonpath(obj, path):
+    """
+    Evaluate a Kubernetes printer-column JSONPath (a restricted subset) against a
+    resource dict and return a display string.
+
+    Supports the forms that actually appear in additionalPrinterColumns: dotted
+    keys, array index [0], wildcard [*] (joined by ','), and the filter
+    [?(@.type=="Ready")] used by cert-manager & friends. Anything it can't parse
+    yields "" rather than raising.
+    """
+    cur = [obj]
+    for raw in _jp_split(path):
+        if not raw:
+            continue
+        m = _JP_STEP.fullmatch(raw)
+        if not m:
+            return ""
+        key, idx, star, fkey, fval = m.groups()
+        nxt = []
+        for node in cur:
+            val = node.get(key) if (key and isinstance(node, dict)) else node
+            if val is None:
+                continue
+            if idx is not None:
+                if isinstance(val, list) and len(val) > int(idx):
+                    nxt.append(val[int(idx)])
+            elif star is not None:
+                nxt.extend(val if isinstance(val, list) else [])
+            elif fkey is not None:
+                for e in (val if isinstance(val, list) else []):
+                    if isinstance(e, dict) and str(e.get(fkey.strip())) == fval:
+                        nxt.append(e)
+            else:
+                nxt.append(val)
+        cur = nxt
+        if not cur:
+            return ""
+    parts = [str(v) for v in cur if v is not None and not isinstance(v, (dict, list))]
+    return ",".join(parts)
+
+
+def _kind_from_crd(crd):
+    """
+    Build a browsable Kind from a discovered CRD dict (see list_crds).
+
+    Columns come from the CRD's own additionalPrinterColumns so each object shows
+    its author-defined state (STATE/READY/VALID/etc.) exactly like `kubectl get`.
+    CRDs that declare none fall back to a generic 'status' hint column.
+    """
+    label = f'{crd["kind"]}  ({crd["group"]})' if crd["group"] else crd["kind"]
+    namespaced = crd["scope"] == "Namespaced"
+    # Only priority-0 columns show in the default table (priority>0 == -o wide).
+    pcols = [c for c in (crd.get("printerColumns") or []) if c.get("priority", 0) == 0]
+
+    if pcols:
+        columns = [("name", 300)]
+        for c in pcols:
+            columns.append((c["name"].lower(), 160))
+        columns.append(("age", 80))
+
+        def row(it, _pcols=pcols):
+            vals = [_meta(it)["name"]]
+            for c in _pcols:
+                raw = _jsonpath(it, c["jsonPath"])
+                if c.get("type") == "date" and raw:
+                    raw = age_from(raw)      # render timestamps as an age
+                vals.append(raw)
+            vals.append(_row_age(it))
+            return vals
+    else:
+        columns = [("name", 360), ("status", 220), ("age", 80)]
+
+        def row(it):
+            return [_meta(it)["name"], _status_hint(it), _row_age(it)]
+
+    return Kind(label, crd["fq"], namespaced, columns, row)
+
+
+class CustomResourceBrowser(ResourceBrowser):
+    """
+    A ResourceBrowser whose types are the cluster's CRDs, discovered at runtime.
+
+    This is how non-standard, operator-installed resources (cert-manager
+    Certificates, Argo Applications, NGINX VirtualServers/TransportServers, etc.)
+    become browsable — the app doesn't hardcode them, it asks the cluster what
+    CRDs exist and offers each as a Type. A "⟳ Reload CRDs" button re-discovers
+    after installing/removing an operator.
+    """
+
+    def __init__(self, parent, get_context):
+        super().__init__(parent, get_context, [])  # no kinds until discovered
+        self._crd_q: queue.Queue = queue.Queue()
+        # Add a "Reload CRDs" button into the existing Type/Namespace bar row.
+        ttk.Button(self.kind_box.master, text="⟳ Reload CRDs",
+                   command=self._discover).pack(side="left", padx=(2, 8))
+        self.status.config(text="Discovering CRDs…")
+        self.after(150, self._poll_crds)
+        self._discover()
+
+    def _discover(self):
+        """Ask the cluster for its CRDs off-thread (result handled in _poll_crds)."""
+        ctx = self._get_context()
+        self.status.config(text="⏳ discovering CRDs…")
+
+        def work():
+            try:
+                crds = kubectl_collect.list_crds(ctx)
+                self._crd_q.put(("ok", crds))
+            except Exception as e:  # noqa: BLE001
+                self._crd_q.put(("err", e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_crds(self):
+        """Drain discovery results and repopulate the Type dropdown from the CRDs."""
+        if not self._alive:
+            return
+        try:
+            while True:
+                status, payload = self._crd_q.get_nowait()
+                if status == "err":
+                    self.status.config(text=f"⚠ {payload}")
+                elif not payload:
+                    self.status.config(text="No CRDs found in this cluster.")
+                else:
+                    self.set_kinds([_kind_from_crd(c) for c in payload])
+                    self.status.config(text=f"{len(payload)} CRD types")
+        except queue.Empty:
+            pass
+        self.after(300, self._poll_crds)
 
 
 def main():

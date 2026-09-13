@@ -43,12 +43,75 @@ def kubectl_path() -> str | None:
     return shutil.which(_base_cmd()[0])
 
 
+def edit_argv(ktype: str, name: str, *, namespace: str = "",
+              context: str = "") -> list[str]:
+    """
+    The full argv for `kubectl edit <ktype>/<name>` (honoring the KUBECTL override,
+    namespace, and context).
+
+    This is meant to be handed to a *new terminal window* — `kubectl edit` is
+    interactive (it opens $KUBE_EDITOR/$EDITOR and applies on save), so it can't
+    run headless the way the read-only calls do.
+    """
+    cmd = _base_cmd()
+    if context:
+        cmd += ["--context", context]
+    cmd += ["edit", f"{ktype}/{name}"]
+    if namespace:
+        cmd += ["-n", namespace]
+    return cmd
+
+
+# Optional hook: if the GUI sets this, every kubectl argv the app actually runs is
+# reported to it (from worker threads) so it can show "the command you'd type" in a
+# bottom bar. Left as None for headless/library use — see format_command / get_argv.
+command_listener = None
+
+
+def _record(cmd: list[str]) -> None:
+    """Report an about-to-run kubectl argv to command_listener, if one is set."""
+    cb = command_listener
+    if cb is not None:
+        try:
+            cb(list(cmd))
+        except Exception:  # noqa: BLE001 — telemetry must never break a real call
+            pass
+
+
+def format_command(argv: list[str]) -> str:
+    """A copy-pasteable one-line string for a kubectl argv (quoting args w/ spaces)."""
+    parts = []
+    for a in argv:
+        parts.append(f'"{a}"' if (" " in a or not a) else a)
+    return " ".join(parts)
+
+
+def get_argv(ktype: str, name: str = "", *, namespace: str = "", context: str = "",
+             output: str = "yaml", describe: bool = False) -> list[str]:
+    """
+    The full argv the app would run to fetch one resource (for the "show me the
+    command" preview). `describe=True` gives `kubectl describe …` instead of get.
+    """
+    cmd = _base_cmd()
+    if context:
+        cmd += ["--context", context]
+    cmd += ["describe", ktype] if describe else ["get", ktype]
+    if name:
+        cmd.append(name)
+    if namespace:
+        cmd += ["-n", namespace]
+    if output and not describe:
+        cmd += ["-o", output]
+    return cmd
+
+
 def _run(args: list[str], *, context: str = "", timeout: int = 60) -> str:
     """Run `kubectl <args>` and return stdout, raising KubectlError on failure."""
     cmd = _base_cmd()
     if context:
         cmd += ["--context", context]
     cmd += args
+    _record(cmd)
 
     if shutil.which(cmd[0]) is None:
         raise KubectlError(
@@ -105,6 +168,7 @@ def popen_logs(namespace: str, pod: str, *, context: str = "",
             "--all-containers=true", "--prefix=true", f"--tail={tail}"]
     if follow:
         cmd.append("-f")
+    _record(cmd)
     if shutil.which(cmd[0]) is None:
         raise KubectlError(f"'{cmd[0]}' was not found on your PATH.")
     return subprocess.Popen(
@@ -127,6 +191,7 @@ def popen_exec(namespace: str, pod: str, shell: str = "sh", *,
     if context:
         cmd += ["--context", context]
     cmd += ["exec", "-i", pod, "-n", namespace, "--", shell]
+    _record(cmd)
     if shutil.which(cmd[0]) is None:
         raise KubectlError(f"'{cmd[0]}' was not found on your PATH.")
     proc = subprocess.Popen(
@@ -154,6 +219,75 @@ def list_items(ktype: str, *, namespace: str = "", all_namespaces: bool = False,
     args += ["-o", "json"]
     data = json.loads(_run(args, context=context, timeout=timeout))
     return data.get("items", [])
+
+
+def list_crds(context: str = "") -> list[dict]:
+    """
+    Every CustomResourceDefinition in the cluster, as lightweight dicts.
+
+    Each entry has enough to browse the CRD's instances generically:
+      group, plural, kind, scope ("Namespaced"/"Cluster"), shortNames, fq,
+      printerColumns
+    where ``fq`` is the fully-qualified "<plural>.<group>" name you pass to
+    ``kubectl get`` to avoid ambiguity between CRDs sharing a plural, and
+    ``printerColumns`` is the CRD's own additionalPrinterColumns (name, jsonPath,
+    type, priority) — the columns kubectl shows so you can see each object's
+    author-defined state (Ready/Valid/etc.). Returns [] (not an error) if the
+    cluster has no CRDs or the caller can't list them.
+    """
+    try:
+        items = list_items("customresourcedefinitions", all_namespaces=False,
+                           context=context, timeout=30)
+    except KubectlError:
+        return []
+    out = []
+    for it in items:
+        spec = it.get("spec", {})
+        names = spec.get("names", {})
+        group = spec.get("group", "")
+        plural = names.get("plural", "")
+        if not plural:
+            continue
+        out.append({
+            "group": group,
+            "plural": plural,
+            "kind": names.get("kind", plural),
+            "scope": spec.get("scope", "Namespaced"),
+            "shortNames": names.get("shortNames", []) or [],
+            "fq": f"{plural}.{group}" if group else plural,
+            "printerColumns": _crd_printer_columns(spec),
+        })
+    return sorted(out, key=lambda c: (c["group"], c["kind"]))
+
+
+def _crd_printer_columns(spec: dict) -> list[dict]:
+    """
+    additionalPrinterColumns from a CRD spec, preferring the storage version.
+
+    Columns are per-version in apiextensions/v1, so pick the version that's stored
+    (that's what a plain `kubectl get` prints), falling back to the first served
+    version, then the first version. Each column dict has name/jsonPath/type/priority.
+    """
+    versions = spec.get("versions") or []
+    if not versions:
+        return []
+    chosen = (next((v for v in versions if v.get("storage")), None)
+              or next((v for v in versions if v.get("served")), None)
+              or versions[0])
+    cols = chosen.get("additionalPrinterColumns") or []
+    out = []
+    for c in cols:
+        # v1 uses "jsonPath"; the older apiextensions v1beta1 used "JSONPath".
+        path = c.get("jsonPath") or c.get("JSONPath") or ""
+        if not c.get("name") or not path:
+            continue
+        out.append({
+            "name": c["name"],
+            "jsonPath": path,
+            "type": c.get("type", "string"),
+            "priority": c.get("priority", 0) or 0,
+        })
+    return out
 
 
 def pod_metrics(context: str = "") -> dict:
