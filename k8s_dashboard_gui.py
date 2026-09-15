@@ -385,6 +385,148 @@ def build_model_from_raw(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Table export (CSV / XLSX) — shared by every analysis tab and the grouped
+# resource browser. Exports exactly what's on screen: the Treeview's current
+# (already filtered/sorted) rows, mining the ☑/⧉ helper columns out first.
+# XLSX keeps numbers numeric and percents as real Excel percentages so totals
+# and sorting still work in the sheet.
+# ---------------------------------------------------------------------------
+# Helper columns that only make sense inside the live GUI (checkbox / open).
+_EXPORT_SKIP_COLS = {"sel", "open"}
+_NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_PCT_RE = re.compile(r"^-?\d+(?:\.\d+)?%$")
+
+
+def _exportable_columns(tree) -> list[str]:
+    """Column ids worth exporting — everything but the GUI-only helper columns."""
+    return [c for c in tree["columns"] if c not in _EXPORT_SKIP_COLS]
+
+
+def _export_rows(tree, columns) -> list[list[str]]:
+    """The current on-screen rows (post-filter, in display order) as strings."""
+    return [[tree.set(iid, c) for c in columns] for iid in tree.get_children("")]
+
+
+def _xlsx_cell(value: str):
+    """Map a displayed string to (python_value, number_format|None) for Excel.
+
+    Plain integers/floats become real numbers; "45%" becomes 0.45 with a percent
+    format; anything with a unit suffix (900m, 1.5Gi, "2 cores") stays text so it
+    reads exactly as it does in the GUI.
+    """
+    s = (value or "").strip()
+    if _NUM_RE.match(s):
+        num = float(s)
+        return (int(num) if num.is_integer() else num, None)
+    if _PCT_RE.match(s):
+        body = s[:-1]
+        fmt = "0.0%" if "." in body else "0%"
+        return (float(body) / 100.0, fmt)
+    return (value, None)
+
+
+def export_tree(tree, fmt, *, status_cb=None):
+    """Save a Treeview's current view to ``fmt`` ("csv" or "xlsx").
+
+    ``status_cb(text)`` (optional) is called with a one-line result message.
+    """
+    columns = _exportable_columns(tree)
+    if not columns:
+        return
+    rows = _export_rows(tree, columns)
+    if not rows:
+        messagebox.showinfo("Export", "This table is empty — nothing to export.")
+        return
+    headers = [tree.heading(c, "text") or c for c in columns]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    if fmt == "xlsx":
+        path = filedialog.asksaveasfilename(
+            title="Export table to Excel",
+            defaultextension=".xlsx",
+            initialfile=f"k8s-export-{stamp}.xlsx",
+            filetypes=[("Excel workbook", "*.xlsx"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            import openpyxl
+            from openpyxl.styles import Font
+        except ImportError:
+            messagebox.showerror(
+                "Export failed",
+                "XLSX export needs the 'openpyxl' package.\n\n"
+                "Install it with:  pip install openpyxl")
+            return
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "export"
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            for row in rows:
+                ws.append([""] * len(columns))
+                r = ws.max_row
+                for ci, raw in enumerate(row, start=1):
+                    val, numfmt = _xlsx_cell(raw)
+                    cell = ws.cell(row=r, column=ci, value=val)
+                    if numfmt:
+                        cell.number_format = numfmt
+            ws.freeze_panes = "A2"
+            for ci, h in enumerate(headers, start=1):
+                width = max(len(h), *(len(str(row[ci - 1])) for row in rows))
+                ws.column_dimensions[
+                    openpyxl.utils.get_column_letter(ci)].width = min(max(width + 2, 8), 60)
+            wb.save(path)
+        except OSError as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+    else:  # csv
+        path = filedialog.asksaveasfilename(
+            title="Export table to CSV",
+            defaultextension=".csv",
+            initialfile=f"k8s-export-{stamp}.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except OSError as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+
+    if status_cb:
+        status_cb(f"✓ exported {len(rows)} rows → {path}")
+
+
+def add_export_buttons(toolbar, tree, *, status_cb=None, side="right"):
+    """Pack CSV + XLSX export buttons (and wire a right-click menu on ``tree``)."""
+    ttk.Button(toolbar, text="⬇ CSV",
+               command=lambda: export_tree(tree, "csv", status_cb=status_cb)
+               ).pack(side=side, padx=(4, 0))
+    ttk.Button(toolbar, text="⬇ XLSX",
+               command=lambda: export_tree(tree, "xlsx", status_cb=status_cb)
+               ).pack(side=side)
+    menu = tk.Menu(tree, tearoff=0)
+    menu.add_command(label="Export to CSV…",
+                     command=lambda: export_tree(tree, "csv", status_cb=status_cb))
+    menu.add_command(label="Export to Excel (XLSX)…",
+                     command=lambda: export_tree(tree, "xlsx", status_cb=status_cb))
+
+    def popup(event):
+        menu.tk_popup(event.x_root, event.y_root)
+
+    tree.bind("<Button-3>", popup)      # right-click (Win/Linux)
+    tree.bind("<Button-2>", popup)      # middle/right on some macs
+    return menu
+
+
+# ---------------------------------------------------------------------------
 # GUI — main window (Dashboard): control rows, sidebar nav, and the analysis
 # tabs (Overview / Nodes / Deployments / Pods / Resource Management / Trends).
 # The grouped browser + resource-kind registry live further down.
@@ -755,19 +897,11 @@ class Dashboard(tk.Tk):
         tree.tag_configure("crit", background="#5a1e1e")   # red — failing
         tree.tag_configure("warn", background="#5a4a1e")   # amber — heads-up
 
-        ttk.Button(tools, text="⬇ Export CSV",
-                   command=lambda t=tree: self._export_tree_csv(t)).pack(side="right")
-
-        # Right-click anywhere in the table also exports it to CSV.
-        menu = tk.Menu(tree, tearoff=0)
-        menu.add_command(label="Export to CSV…",
-                         command=lambda t=tree: self._export_tree_csv(t))
-
-        def popup(event, t=tree, m=menu):
-            m.tk_popup(event.x_root, event.y_root)
-
-        tree.bind("<Button-3>", popup)      # right-click (Win/Linux)
-        tree.bind("<Button-2>", popup)      # middle/right on some macs
+        # Visible CSV + XLSX buttons, plus a right-click export menu. Both export
+        # exactly the rows currently on screen (current filter + sort order).
+        ttk.Label(tools, text="Export:").pack(side="right", padx=(0, 4))
+        add_export_buttons(tools, tree,
+                           status_cb=lambda t: self.status.config(text=t))
         return tree
 
     def _wire_cmd_preview(self, tree, ktype, name_col, ns_col=None):
@@ -788,41 +922,6 @@ class Dashboard(tk.Tk):
                 ktype, name, namespace=ns, context=self.context_var.get().strip())
             self.show_command(argv, source="selected")
         tree.bind("<<TreeviewSelect>>", on_sel, add="+")
-
-    def _export_tree_csv(self, tree):
-        """Write a Treeview's current columns and rows to a CSV file the user picks.
-
-        Exports what's on screen: current sort order and any selection is ignored
-        (all rows are written). Uses only the stdlib csv module.
-        """
-        columns = list(tree["columns"])
-        if not columns:
-            return
-        rows = tree.get_children("")
-        if not rows:
-            messagebox.showinfo("Export to CSV", "This table is empty — nothing to export.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            title="Export table to CSV",
-            defaultextension=".csv",
-            initialfile=f"k8s-export-{time.strftime('%Y%m%d-%H%M%S')}.csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-
-        headers = [tree.heading(c, "text") or c for c in columns]
-        try:
-            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
-                writer = csv.writer(fh)
-                writer.writerow(headers)
-                for iid in rows:
-                    writer.writerow([tree.set(iid, c) for c in columns])
-        except OSError as e:
-            messagebox.showerror("Export failed", str(e))
-            return
-        self.status.config(text=f"✓ exported {len(rows)} rows → {path}")
 
     def _sort(self, tree, col, desc):
         """
@@ -1257,14 +1356,39 @@ class Dashboard(tk.Tk):
         ttk.Label(bar, text="Namespace:").pack(side="left")
         namespaces = ["(all)"] + sorted({p["namespace"] for p in self.model["pods"]})
         ns_var = tk.StringVar(value="(all)")
-        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=24, state="readonly",
+        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=20, state="readonly",
                               values=namespaces)
         ns_box.pack(side="left", padx=4)
 
+        # Nodepool + Node filters. Pool comes from the nodes model (Karpenter/EKS/
+        # GKE labels); the Node dropdown cascades to just the selected pool's nodes.
+        ttk.Label(bar, text="Nodepool:").pack(side="left", padx=(10, 0))
+        pool_var = tk.StringVar(value="(all)")
+        pool_box = ttk.Combobox(bar, textvariable=pool_var, width=18, state="readonly",
+                                values=["(all)"])
+        pool_box.pack(side="left", padx=4)
+
+        ttk.Label(bar, text="Node:").pack(side="left", padx=(10, 0))
+        node_var = tk.StringVar(value="(all)")
+        node_box = ttk.Combobox(bar, textvariable=node_var, width=22, state="readonly",
+                                values=["(all)"])
+        node_box.pack(side="left", padx=4)
+
         ttk.Label(bar, text="Filter:").pack(side="left", padx=(10, 0))
         filt = tk.StringVar()
-        ttk.Entry(bar, textvariable=filt, width=30).pack(side="left", padx=4)
+        ttk.Entry(bar, textvariable=filt, width=24).pack(side="left", padx=4)
         refresh_status = ttk.Label(bar, text="")
+
+        def node_pool_map():
+            """node name -> nodepool, from whatever nodes we've loaded."""
+            return {n["node"]: n["pool"] for n in self.model["nodes"]}
+
+        def pods_in_pool(pool):
+            """The set of node names belonging to ``pool`` (or all if '(all)')."""
+            npm = node_pool_map()
+            if pool == "(all)":
+                return None
+            return {node for node, pl in npm.items() if pl == pool}
 
         def do_refresh():
             ns = ns_var.get()
@@ -1292,36 +1416,70 @@ class Dashboard(tk.Tk):
 
         ttk.Button(bar, text="⟳ Refresh pods", command=do_refresh).pack(side="left", padx=6)
         refresh_status.pack(side="left", padx=6)
-        cols = ("sel", "open", "namespace", "pod", "node", "ready", "phase", "restarts",
-                "age", "cpu req", "cpu used", "mem req", "mem used", "no lim", "⚠ why")
+        cols = ("sel", "open", "namespace", "pod", "node", "nodepool", "ready", "phase",
+                "restarts", "age", "cpu req", "cpu used", "mem req", "mem used",
+                "no lim", "⚠ why")
         tree = self._make_tree(list_frame, cols,
-                               [34, 40, 110, 220, 140, 60, 80, 70, 60, 80, 80, 80, 80, 50, 180])
+                               [34, 40, 110, 200, 140, 120, 60, 80, 70, 60,
+                                80, 80, 80, 80, 50, 180])
         tree.heading("sel", text="☑")
         tree.heading("open", text="⧉")
         tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
         self._wire_cmd_preview(tree, "pods", "pod", "namespace")
 
+        def sync_scopes():
+            """Refresh the pool/node dropdown values from the current model,
+            cascading the Node list to the selected pool. Preserves selections
+            when still valid; otherwise falls back to '(all)'."""
+            npm = node_pool_map()
+            pools = ["(all)"] + sorted({p for p in npm.values() if p})
+            pool_box["values"] = pools
+            if pool_var.get() not in pools:
+                pool_var.set("(all)")
+            in_pool = pods_in_pool(pool_var.get())
+            nodes = sorted({p["node"] for p in self.model["pods"] if p["node"]
+                            and (in_pool is None or p["node"] in in_pool)})
+            node_box["values"] = ["(all)"] + nodes
+            if node_var.get() not in node_box["values"]:
+                node_var.set("(all)")
+
         def refill(*_):
             ms.reset()
             for r in tree.get_children(""):
                 tree.delete(r)
+            sync_scopes()
             q = filt.get().lower()
             ns = ns_var.get()
+            pool = pool_var.get()
+            node = node_var.get()
+            npm = node_pool_map()
+            in_pool = pods_in_pool(pool)
             rows = sorted(self.model["pods"], key=lambda p: p["mem_req_b"], reverse=True)
             for p in rows:
                 if ns != "(all)" and p["namespace"] != ns:
                     continue
-                hay = f'{p["namespace"]} {p["pod"]} {p["node"]}'.lower()
+                if in_pool is not None and p["node"] not in in_pool:
+                    continue
+                if node != "(all)" and p["node"] != node:
+                    continue
+                pool_name = npm.get(p["node"], "")
+                hay = f'{p["namespace"]} {p["pod"]} {p["node"]} {pool_name}'.lower()
                 if q and q not in hay:
                     continue
                 tree.insert("", "end", tags=(p["severity"],), values=(
-                    "☐", "⧉", p["namespace"], p["pod"], p["node"], p["ready"], p["phase"],
-                    p["restarts"], p["age"],
+                    "☐", "⧉", p["namespace"], p["pod"], p["node"], pool_name,
+                    p["ready"], p["phase"], p["restarts"], p["age"],
                     fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
                     fmt_mem(p["mem_req_b"]), fmt_mem(p["mem_used_b"]),
                     "⚠" if p["missing_limits"] else "", p["status_note"],
                 ))
+
+        def on_pool_change(*_):
+            # Changing the pool resets the (now possibly stale) node choice.
+            node_var.set("(all)")
+            refill()
+
         ctx = lambda: self.context_var.get().strip()
         ms = MultiSelect(
             tree,
@@ -1331,6 +1489,8 @@ class Dashboard(tk.Tk):
                                            tree.set(sel, "pod"),
                                            tree.set(sel, "namespace"), ctx()))
         ns_box.bind("<<ComboboxSelected>>", refill)
+        pool_box.bind("<<ComboboxSelected>>", on_pool_change)
+        node_box.bind("<<ComboboxSelected>>", refill)
         filt.trace_add("write", refill)
         refill()
 
@@ -1357,10 +1517,11 @@ class Dashboard(tk.Tk):
         ttk.Button(act, text="Delete…", command=do_delete).pack(side="left")
         act_status.pack(side="left", padx=8)
 
-        ttk.Label(list_frame, text="Pick a namespace or “(all)”, and/or type in Filter. Tick ☑ "
-                  "to select multiple (or just click a row), then Delete. Double-click a pod "
-                  "for details / logs / shell; click ⧉ for a new window. Red = failing, "
-                  "amber = running but restarted; the “⚠ why” column says why.",
+        ttk.Label(list_frame, text="Filter by Namespace, Nodepool, and/or Node (the Node list "
+                  "narrows to the chosen pool), and/or type in Filter. Tick ☑ to select multiple "
+                  "(or just click a row), then Delete. Double-click a pod for details / logs / "
+                  "shell; click ⧉ for a new window. Red = failing, amber = running but restarted; "
+                  "the “⚠ why” column says why. ⬇ CSV/XLSX exports exactly the rows shown.",
                   padding=4).pack(anchor="w")
 
     def _build_group_tab(self, group):
@@ -2910,6 +3071,11 @@ class ResourceBrowser(ttk.Frame):
         self.delete_btn.pack(side="left")
         ttk.Label(act, text="  (double-click a row to open it here; click ⧉ for a new window)"
                   ).pack(side="left", padx=6)
+        # Export the current view (respects the Type/Namespace filters on screen).
+        ttk.Button(act, text="⬇ XLSX", command=lambda: self._export("xlsx")).pack(side="right")
+        ttk.Button(act, text="⬇ CSV", command=lambda: self._export("csv")
+                   ).pack(side="right", padx=(4, 0))
+        ttk.Label(act, text="Export:").pack(side="right", padx=(0, 4))
 
         self._table = ttk.Frame(self._list)
         self._table.pack(fill="both", expand=True)
@@ -2930,6 +3096,14 @@ class ResourceBrowser(ttk.Frame):
     def _cur_kind(self):
         """The Kind currently selected in the Type dropdown."""
         return self._kinds[self.kind_var.get()]
+
+    def _export(self, fmt):
+        """Export the current browser table (current Type/Namespace view)."""
+        if self._tree is None or not self._tree.get_children(""):
+            messagebox.showinfo("Export", "Nothing to export yet — load a resource type first.")
+            return
+        export_tree(self._tree, fmt,
+                    status_cb=lambda t: self.status.config(text=t))
 
     def _reload(self):
         """
@@ -3028,6 +3202,14 @@ class ResourceBrowser(ttk.Frame):
 
         wire_row_actions(tree, self._open_window_for, self._open_inplace_for)
         tree.bind("<<TreeviewSelect>>", lambda e: self._preview_command(), add="+")
+
+        # Right-click to export the current view (matches the toolbar buttons).
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="Export to CSV…", command=lambda: self._export("csv"))
+        menu.add_command(label="Export to Excel (XLSX)…", command=lambda: self._export("xlsx"))
+        tree.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+        tree.bind("<Button-2>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+        self._export_menu = menu   # keep a ref so it isn't garbage-collected
 
     def _preview_command(self):
         """Show `kubectl get <type> <name> …` for the highlighted row in the app's
