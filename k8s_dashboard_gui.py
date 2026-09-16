@@ -1610,8 +1610,8 @@ class Dashboard(tk.Tk):
             "Pods reserving far more memory than they use — the over-provisioning that "
             "forces new nodes. Scheduling uses requests, not usage.")).pack(anchor="w")
         cols = ("namespace", "pod", "node", "mem req", "mem used", "mem WASTED",
-                "cpu req", "cpu used")
-        tree = self._make_tree(frame, cols, [110, 240, 150, 90, 90, 100, 80, 80])
+                "cpu req", "cpu used", "cpu WASTED")
+        tree = self._make_tree(frame, cols, [110, 240, 150, 90, 90, 100, 80, 80, 90])
         self._wire_cmd_preview(tree, "pods", "pod", "namespace")
         empty = ttk.Label(frame, padding=6, text="No metrics-server data available.")
 
@@ -1633,10 +1633,12 @@ class Dashboard(tk.Tk):
             rows.sort(key=lambda p: p["mem_req_b"] - (p["mem_used_b"] or 0), reverse=True)
             for p in rows[:40]:
                 waste = p["mem_req_b"] - (p["mem_used_b"] or 0)
+                cpu_waste = (p["cpu_req_m"] or 0) - (p["cpu_used_m"] or 0)
                 tree.insert("", "end", values=(
                     p["namespace"], p["pod"], p["node"], fmt_mem(p["mem_req_b"]),
                     fmt_mem(p["mem_used_b"]), fmt_mem(waste),
                     fmt_cpu(p["cpu_req_m"]), fmt_cpu(p["cpu_used_m"]),
+                    fmt_cpu(cpu_waste),
                 ))
             empty.pack_forget()
             if not rows:
