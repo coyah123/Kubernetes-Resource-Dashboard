@@ -1494,6 +1494,33 @@ class Dashboard(tk.Tk):
         filt.trace_add("write", refill)
         refill()
 
+        # The Nodepool/Node filters need the nodes model. Offline snapshots and a
+        # whole-cluster refresh already load it, but a live session that only ever
+        # scoped-refreshed pods wouldn't have it — so lazily pull nodes the first
+        # time this tab is shown (once per context; skipped when offline).
+        _nodes_probe = {"ctx": None}
+
+        def ensure_nodes(*_):
+            if self.model["nodes"]:
+                return
+            ctx0 = ctx()
+            if not ctx0 or _nodes_probe["ctx"] == ctx0:
+                return
+            _nodes_probe["ctx"] = ctx0
+
+            def fetch():
+                nodes = kubectl_collect.list_items("nodes", context=ctx0)
+                nu = self._node_usage_map(ctx0)
+                return [build_node_row(n, nu.get(n["metadata"]["name"], (None, None)))
+                        for n in nodes]
+
+            def apply(rows):
+                self.model["nodes"] = rows
+                refill()
+            self._scoped_refresh(fetch, apply, refresh_status)
+
+        frame.bind("<Map>", ensure_nodes, add="+")
+
         act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
         act.pack(fill="x")
         act_status = ttk.Label(act, text="")
@@ -3030,7 +3057,7 @@ class ResourceBrowser(ttk.Frame):
         self._get_context = get_context
         self._kinds = {k.label: k for k in kinds}
         self._q: queue.Queue = queue.Queue()
-        self._rows = {}               # tree iid -> (name, namespace)
+        self._rows = {}               # tree iid -> (Kind, name, namespace)
         self._namespaces = ["(all)"]
         self._tree = None
         self._detail = None           # in-place detail view, when open
@@ -3096,6 +3123,15 @@ class ResourceBrowser(ttk.Frame):
     def _cur_kind(self):
         """The Kind currently selected in the Type dropdown."""
         return self._kinds[self.kind_var.get()]
+
+    def _item_kind(self, kind, it):
+        """The Kind a single listed item belongs to.
+
+        For ordinary single-type tables this is just ``kind``; aggregate views
+        that merge several kinds override this to return each row's real kind so
+        open/preview/delete target the right resource type.
+        """
+        return kind
 
     def _export(self, fmt):
         """Export the current browser table (current Type/Namespace view)."""
@@ -3197,7 +3233,9 @@ class ResourceBrowser(ttk.Frame):
             ns = _meta(it).get("namespace", "")
             vals = ["⧉"] + ([ns] if kind.namespaced else []) + kind.row(it)
             iid = tree.insert("", "end", values=vals)
-            self._rows[iid] = (_meta(it).get("name", ""), ns)
+            # Store the row's OWN kind (usually ``kind``; may differ in an
+            # aggregate view that merges several kinds — see _item_kind).
+            self._rows[iid] = (self._item_kind(kind, it), _meta(it).get("name", ""), ns)
         self.status.config(text=f"{len(items)} {kind.label.lower()}")
 
         wire_row_actions(tree, self._open_window_for, self._open_inplace_for)
@@ -3220,8 +3258,7 @@ class ResourceBrowser(ttk.Frame):
         top = self.winfo_toplevel()
         if not hasattr(top, "show_command"):
             return
-        kind = self._cur_kind()
-        name, ns = self._rows[iid]
+        kind, name, ns = self._rows[iid]
         argv = kubectl_collect.get_argv(
             kind.ktype, name, namespace=ns, context=self._get_context())
         top.show_command(argv, source="selected")
@@ -3230,8 +3267,8 @@ class ResourceBrowser(ttk.Frame):
         """(Kind, name, namespace) for a row iid, or None if it's unknown."""
         if iid not in self._rows:
             return None
-        name, ns = self._rows[iid]
-        return self._cur_kind(), name, ns
+        kind, name, ns = self._rows[iid]
+        return kind, name, ns
 
     def _open_window_for(self, iid):
         """Open a row's detail in a separate window (the ⧉ column action)."""
@@ -3257,8 +3294,8 @@ class ResourceBrowser(ttk.Frame):
         if not iid or iid not in self._rows:
             messagebox.showinfo("No selection", "Select a row first.")
             return None
-        name, ns = self._rows[iid]
-        return self._cur_kind(), name, ns
+        kind, name, ns = self._rows[iid]
+        return kind, name, ns
 
     def _do_scale(self):
         """Prompt for a replica count and scale the selected workload."""
@@ -3435,7 +3472,17 @@ def _kind_from_crd(crd):
         def row(it):
             return [_meta(it)["name"], _status_hint(it), _row_age(it)]
 
-    return Kind(label, crd["fq"], namespaced, columns, row)
+    k = Kind(label, crd["fq"], namespaced, columns, row)
+    # Extra metadata so the custom-resource browser can group by API group and
+    # drill into a single kind (label stays globally unique for the _kinds map).
+    k.group = crd["group"] or ""
+    k.crd_kind = crd["kind"]
+    return k
+
+
+# Sentinel shown in the Kind dropdown to list every kind in the chosen group.
+_ALL_KINDS = "(all kinds)"
+_ALL_GROUPS = "(all groups)"
 
 
 class CustomResourceBrowser(ResourceBrowser):
@@ -3452,12 +3499,131 @@ class CustomResourceBrowser(ResourceBrowser):
     def __init__(self, parent, get_context):
         super().__init__(parent, get_context, [])  # no kinds until discovered
         self._crd_q: queue.Queue = queue.Queue()
+        self._crd_kinds: list = []            # every discovered CRD as a Kind
+        self._visible: dict = {}              # Kind-dropdown label -> Kind (current group)
+
+        bar = self.kind_box.master
+        # A "Group" (API group) filter to the LEFT of the existing Type dropdown.
+        # Picking a group narrows the Type list to that group's kinds and offers
+        # an "(all kinds)" aggregate view of everything the group deploys.
+        first = bar.winfo_children()[0]       # the existing "Type:" label
+        self.group_lbl = ttk.Label(bar, text="Group:")
+        self.group_var = tk.StringVar(value=_ALL_GROUPS)
+        self.group_box = ttk.Combobox(bar, textvariable=self.group_var, width=26,
+                                      state="readonly", values=[_ALL_GROUPS])
+        self.group_lbl.pack(side="left", before=first)
+        self.group_box.pack(side="left", padx=4, before=first)
+        self.group_box.bind("<<ComboboxSelected>>", lambda e: self._on_group_change())
+        # The base's "Type:" label now reads "Kind:" — it selects the kind/CR.
+        first.config(text="Kind:")
+
         # Add a "Reload CRDs" button into the existing Type/Namespace bar row.
-        ttk.Button(self.kind_box.master, text="⟳ Reload CRDs",
+        ttk.Button(bar, text="⟳ Reload CRDs",
                    command=self._discover).pack(side="left", padx=(2, 8))
         self.status.config(text="Discovering CRDs…")
         self.after(150, self._poll_crds)
         self._discover()
+
+    # -- group / kind selection -------------------------------------------
+    def _on_group_change(self):
+        """Repopulate the Kind dropdown for the selected group and reload.
+
+        '(all groups)' shows every kind flat (the original behaviour). A specific
+        group lists its kinds plus an '(all kinds)' aggregate, defaulting to the
+        aggregate so you see everything the group deploys at a glance.
+        """
+        group = self.group_var.get()
+        if group == _ALL_GROUPS:
+            kinds = sorted(self._crd_kinds, key=lambda k: k.label)
+            self._visible = {k.label: k for k in kinds}
+            values = [k.label for k in kinds]
+            self.kind_var.set(values[0] if values else "")
+        else:
+            kinds = sorted((k for k in self._crd_kinds if k.group == group),
+                           key=lambda k: k.crd_kind)
+            self._visible = {k.crd_kind: k for k in kinds}
+            values = [_ALL_KINDS] + [k.crd_kind for k in kinds]
+            self.kind_var.set(_ALL_KINDS)
+        self.kind_box["values"] = values
+        self._reload()
+
+    def _aggregate_kind(self, group):
+        """A synthetic Kind that merges every kind in ``group`` into one table."""
+        members = [k for k in self._crd_kinds if k.group == group]
+        cols = [("kind", 180), ("name", 300), ("status", 220), ("age", 80)]
+
+        def row(it):
+            mk = it.get("_agg_kind")
+            return [mk.crd_kind if mk else it.get("kind", ""),
+                    _meta(it)["name"], _status_hint(it), _row_age(it)]
+
+        ak = Kind(f"all {group}", "", True, cols, row, deletable=False)
+        ak.group = group
+        ak.crd_kind = _ALL_KINDS
+        ak.is_aggregate = True
+        ak.member_kinds = members
+        return ak
+
+    def _cur_kind(self):
+        """The Kind selected via Group + Kind (may be the aggregate synthetic)."""
+        name = self.kind_var.get()
+        if name == _ALL_KINDS:
+            return self._aggregate_kind(self.group_var.get())
+        return self._visible.get(name)
+
+    def _item_kind(self, kind, it):
+        """In an aggregate table each row carries its own tagged member kind."""
+        return it.get("_agg_kind") or kind
+
+    def _reload(self):
+        """List the current selection; multi-list & merge in aggregate mode."""
+        if not self._alive:
+            return
+        kind = self._cur_kind()
+        if kind is None:
+            self.status.config(text="Pick a group / kind.")
+            return
+        if not getattr(kind, "is_aggregate", False):
+            super()._reload()
+            return
+
+        # Aggregate: list every member kind and merge. Bulk actions don't apply
+        # to a mixed table, so disable them; the namespace filter still does.
+        self.ns_box.state(["!disabled"])
+        for b in (self.scale_btn, self.restart_btn, self.delete_btn):
+            b.state(["disabled"])
+        self.status.config(text=f"⏳ loading {len(kind.member_kinds)} kinds…")
+        ctx = self._get_context()
+        ns = self.ns_var.get()
+        need_ns_list = self._namespaces == ["(all)"]
+
+        def work():
+            merged, errors = [], []
+            for mk in kind.member_kinds:
+                want_ns = ns if (mk.namespaced and ns != "(all)") else ""
+                all_ns = mk.namespaced and ns == "(all)"
+                try:
+                    items = kubectl_collect.list_items(
+                        mk.ktype, namespace=want_ns, all_namespaces=all_ns, context=ctx)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{mk.crd_kind}: {e}")
+                    continue
+                for it in items:
+                    it["_agg_kind"] = mk
+                merged.extend(items)
+            nslist = None
+            if need_ns_list:
+                try:
+                    nslist = kubectl_collect.list_namespaces(ctx)
+                except Exception:  # noqa: BLE001
+                    nslist = None
+            self._q.put(("ok", kind, merged, nslist))
+            if errors:
+                self._q.put(("err", kind,
+                             f"{len(errors)} kind(s) unavailable: " + "; ".join(errors[:3]),
+                             None))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _discover(self):
         """Ask the cluster for its CRDs off-thread (result handled in _poll_crds)."""
@@ -3485,11 +3651,22 @@ class CustomResourceBrowser(ResourceBrowser):
                 elif not payload:
                     self.status.config(text="No CRDs found in this cluster.")
                 else:
-                    self.set_kinds([_kind_from_crd(c) for c in payload])
-                    self.status.config(text=f"{len(payload)} CRD types")
+                    self._apply_crds([_kind_from_crd(c) for c in payload])
         except queue.Empty:
             pass
         self.after(300, self._poll_crds)
+
+    def _apply_crds(self, kinds):
+        """Store discovered CRD kinds and (re)populate the Group dropdown."""
+        self._crd_kinds = kinds
+        self._kinds = {k.label: k for k in kinds}   # keep base map consistent
+        groups = sorted({k.group for k in kinds if k.group})
+        self.group_box["values"] = [_ALL_GROUPS] + groups
+        if self.group_var.get() not in self.group_box["values"]:
+            self.group_var.set(_ALL_GROUPS)
+        self.status.config(
+            text=f"{len(kinds)} CRD types across {len(groups)} group(s)")
+        self._on_group_change()
 
 
 def main():
