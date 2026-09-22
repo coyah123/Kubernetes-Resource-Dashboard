@@ -74,8 +74,9 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
 **Tabs:**
 - **🏠 Overview** — cluster summary: node/deploy/pod counts, capacity (allocatable
   vs requested vs used) for CPU and memory, and the biggest memory offenders
-- **Nodes** — requested % vs used % per node; open a node for its details, events,
-  and the pods running on it
+- **Nodes** — requested % vs used % per node, plus pod-IP capacity (**ip used /
+  ip alloc / ip left**, see **Pod-IP capacity** below); open a node for its
+  details, events, and the pods running on it
 - **Deployments** — filter by namespace; per-pod and total (×replicas) reserved
   footprint; open a deployment for its YAML, events, and the pods it manages;
   **tick ☑ rows to bulk rollout-restart or delete**
@@ -108,8 +109,9 @@ tabs have always refreshed per-type. **Overview** is the exception — it summar
 every kind, so its refresh does the full "Refresh from cluster".
 
 > Note: the **Nodes** refresh updates node capacity/usage only. The per-node
-> "pods" count and "req %" columns are derived from the current pod model, so
-> refresh **Pods** (or do a full cluster refresh) to bring those in sync.
+> "pods" count, "req %" columns, and **"ip used" / "ip left" / "ip used%"**
+> columns are all derived from the current pod model, so refresh **Pods** (or
+> do a full cluster refresh) to bring those in sync.
 
 Rows across the app share one interaction model:
 
@@ -187,7 +189,10 @@ context selected at the top and needs metrics-server for the usage lines.
 glance (missing resource limits alone is *not* reddened — it's common and rarely
 urgent):
 - **Nodes** — the node is **over 85% requested** on CPU *or* memory (scheduler
-  sees it as nearly full), or **NotReady**. The **⚠ why** column spells out which.
+  sees it as nearly full), **over 85% of its pod-IP capacity used**, or
+  **NotReady**. The **⚠ why** column spells out which. A node can look idle on
+  CPU/memory and still be unable to take another pod if it's out of IPs —
+  that's exactly what the IP columns catch.
 - **Pods** and **Pods by namespace** — the pod is unhealthy (not
   Running/Succeeded, a container reason like `CrashLoopBackOff`/`ImagePullBackOff`,
   or restarts). The **⚠ why** column gives the exact reason for every red row.
@@ -324,6 +329,109 @@ kubectl describe node <node>     # "Allocated resources" = requested % of capaci
 kubectl get nodes -o json
 ```
 
+### Pod-IP capacity (Nodes tab: "ip used" / "ip alloc" / "ip left" / "ip used%")
+
+Kubernetes has no API field that literally says "IPs remaining on this node."
+There's no `GET`-able free-address-pool endpoint — the CNI plugin owns that
+bookkeeping internally and the API server never sees it. So instead of trying
+to talk to the CNI (which would mean different code per CNI, and no code at
+all for whichever one *your* cluster runs), the app derives an equivalent
+number from two `kubectl` calls it's already making for other tabs. No extra
+requests are issued for this.
+
+**Step 1 — get the ceiling, from `kubectl get nodes -o json`:**
+
+Every node object carries `status.allocatable`, the same block the CPU/memory
+allocatable columns already come from:
+
+```json
+"status": {
+  "allocatable": { "cpu": "4", "memory": "15897452Ki", "pods": "110" }
+}
+```
+
+`build_node_row()` reads `allocatable.pods` straight off that and stores it as
+`pods_alloc` — this becomes the **`ip alloc`** column. That field is kubelet's
+**max-pods** setting for the node: the scheduler will refuse to place a pod
+there once it's hit, full stop, regardless of how much spare CPU/memory the
+node has. How that number gets set varies by environment:
+
+- **AWS EKS with the VPC CNI** computes it *for* you, from real IP capacity: a
+  bootstrap script (`max-pods-calculator.sh`) looks at the EC2 instance
+  type's ENI count and IPs-per-ENI and sets `--max-pods` to exactly the number
+  of pod IPs that instance can hand out. Here, `ip alloc` **is** the literal
+  IP ceiling — not a proxy, the actual number.
+- **Everything else** (GKE, AKS, kubenet, Calico, Cilium, Flannel, on-prem,
+  k3s/minikube, …) sets `--max-pods` to a fixed default (often 110) that's
+  usually *unrelated* to actual subnet size — a typical `/24` pod-CIDR block
+  has 254 usable addresses, well above 110, so IPs aren't really the binding
+  constraint there. But `--max-pods` is still the real, enforced cap on how
+  many more pods (and therefore pod IPs) that node can accept, so the column
+  is still answering the right practical question — it just isn't always
+  "how many raw addresses are free in the subnet."
+
+**Step 2 — get current usage, from `kubectl get pods -A -o json`:**
+
+Every pod carries `spec.nodeName` (which node it landed on) and
+`spec.hostNetwork` (`build_pod_row()` records both). In the Nodes tab's
+`refill()`, the app loops over every pod currently held in memory and buckets
+them by `nodeName`, incrementing a per-node counter for each pod **except**
+ones with `hostNetwork: true`. A hostNetwork pod (common for CNI daemonsets,
+`kube-proxy`, some monitoring agents) doesn't get its own pod IP at all — it
+binds directly to the node's own host IP/ports — so counting it would
+overstate usage. That per-node counter is the **`ip used`** column.
+
+**Step 3 — combine them:**
+
+The node list and the pod list come from two independent `kubectl` calls;
+they're joined in memory purely by matching `pod.node == node.name` (there's
+no single query that returns both together). Once joined:
+
+```
+ip alloc  = node's status.allocatable.pods
+ip used   = count of pods on that node where hostNetwork != true
+ip left   = ip alloc − ip used
+ip used%  = ip used / ip alloc × 100   (drives the ⚠ over-85% warning,
+                                          same threshold as the CPU/mem checks)
+```
+
+Worked example from this cluster: node `norbbuntu` has `allocatable.pods =
+110`. 25 pods are currently scheduled on it, none of them hostNetwork, so
+`ip used = 25`, `ip left = 85`, `ip used% ≈ 23%` — nowhere near the warning
+threshold.
+
+**Why this is accurate:** it's always derived from the same two live API
+objects (`Node.status.allocatable.pods`, `Pod.spec.nodeName` /
+`Pod.spec.hostNetwork`) that the scheduler itself uses to decide placement —
+so "ip left" reflects the same ceiling `kubectl` and the scheduler would hit.
+It's also universal: it works identically on EKS, GKE, AKS, k3s, kubeadm,
+minikube — anything you can point `kubectl` at — with zero cloud-provider API
+calls or CNI-specific code.
+
+**Why it's not perfectly accurate everywhere:** on non-VPC-CNI clusters,
+`allocatable.pods` is a policy cap chosen by whoever configured kubelet, not a
+live count of free addresses in an IP range — a node could theoretically have
+"0 IPs left" per this column while its actual subnet still has hundreds of
+unused addresses (max-pods hit first), or vice versa in a misconfigured
+cluster. The app deliberately does **not** read `spec.podCIDR` and compute
+subnet math (network address, broadcast, usable host count) as an
+alternative, because many common CNIs — AWS VPC CNI chief among them — don't
+populate `podCIDR` on the node at all, so that approach would silently break
+on exactly the clusters where IP exhaustion is most likely to matter. Also
+worth knowing: a completed/terminated pod that still exists as an object
+(e.g. an unswept `Job` pod in `Succeeded`/`Failed` phase) is still counted
+here if present in the current pod list, even though its actual IP has
+usually already been released back to the CNI — a stale/uncleaned pod list
+can make usage look slightly higher than it really is.
+
+Human-readable equivalent, run per node:
+
+```bash
+kubectl get node <node> -o jsonpath='{.status.allocatable.pods}'
+kubectl get pods -A --field-selector spec.nodeName=<node> -o json \
+  | jq '[.items[] | select(.spec.hostNetwork != true)] | length'
+```
+
 **Actual usage (metrics-server)** — real live CPU/memory. `kubectl top` has no JSON
 output, so the app hits the raw metrics API. If metrics-server isn't installed these
 fail and the usage columns go blank (everything else still works):
@@ -343,6 +451,19 @@ kubectl top nodes                                         # human-readable equiv
   - macOS: `brew install python-tk` (match your version, e.g. `python-tk@3.12`),
     or reinstall Python from python.org which includes it.
   - Debian/Ubuntu: `sudo apt install python3-tk`. Fedora: `sudo dnf install python3-tkinter`.
+- **`macOS 26 (2601) or later required, have instead 16 (1601)` followed by
+  `zsh: abort`** — this is a bug in Apple's ancient system Tcl/Tk (the one
+  bundled with `/usr/bin/python3`), not this app. Its internal OS-version
+  check can't parse macOS's newer year-based version numbers (macOS 26 reads
+  back as "16") and aborts before any of the app's code runs. Same class of
+  bug as the old `macOS 11 (1107) or later required, have instead 11 (1106)`
+  error from the 10.x → 11 jump. Fix: don't launch with the stock system
+  Python — use one with a modern bundled Tk:
+  - `brew install python-tk@3.12 python@3.12`, then run with that interpreter,
+    e.g. `/opt/homebrew/bin/python3.12 k8s_dashboard_gui.py` (Apple Silicon) or
+    `/usr/local/bin/python3.12 ...` (Intel) — or install Python from
+    [python.org](https://www.python.org/downloads/), which bundles a current
+    Tcl/Tk.
 - **"kubectl not found on PATH"** — install kubectl, or if it's installed under a
   different name/path, point the app at it with the `KUBECTL` env var (see
   **Custom kubectl command** in Usage).

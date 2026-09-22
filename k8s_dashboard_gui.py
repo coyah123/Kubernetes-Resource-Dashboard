@@ -247,6 +247,7 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
         "ready": f"{n_ready}/{n_total}", "restarts": restarts,
         "age": age_from(p["metadata"].get("creationTimestamp")),
         "pod_ip": status.get("podIP", "—"), "status_note": ", ".join(note_parts),
+        "host_network": bool(spec.get("hostNetwork", False)),
         "severity": severity,
         "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
         "cpu_used_m": usage[0], "mem_used_b": usage[1], "missing_limits": missing,
@@ -288,6 +289,11 @@ def build_node_row(n: dict, usage=(None, None)) -> dict:
         "cpu_alloc_m": cpu_to_milli(alloc.get("cpu")),
         "mem_alloc_b": mem_to_bytes(alloc.get("memory")),
         "cpu_used_m": usage[0], "mem_used_b": usage[1],
+        # Pod-IP capacity: kubelet's max-pods (allocatable.pods) is what actually
+        # gates "how many more pod IPs can this node hand out" — on AWS VPC CNI
+        # it's computed directly from the instance type's ENI/IP capacity, and on
+        # other CNIs it's still the hard cap the scheduler enforces either way.
+        "pods_alloc": int(alloc["pods"]) if alloc.get("pods") else None,
     }
 
 
@@ -1152,10 +1158,12 @@ class Dashboard(tk.Tk):
 
         status.pack(side="left", padx=8)
 
-        cols = ("open", "node", "pool", "ready", "pods", "cpu alloc", "cpu req%", "cpu used%",
+        cols = ("open", "node", "pool", "ready", "pods", "ip used", "ip alloc", "ip left",
+                "ip used%", "cpu alloc", "cpu req%", "cpu used%",
                 "mem alloc", "mem req", "mem req%", "mem used", "mem used%", "⚠ why")
         tree = self._make_tree(list_frame, cols,
-                               [40, 150, 130, 70, 55, 90, 80, 80, 90, 90, 80, 90, 80, 200])
+                               [40, 150, 130, 70, 55, 65, 65, 65, 75, 90, 80, 80,
+                                90, 90, 80, 90, 80, 200])
         tree.heading("open", text="⧉")
         tree.column("open", anchor="center", stretch=False)
         self._wire_cmd_preview(tree, "nodes", "node")
@@ -1174,21 +1182,36 @@ class Dashboard(tk.Tk):
             # aggregate pod requests per node (from the current pod model)
             agg = {}
             for p in self.model["pods"]:
-                a = agg.setdefault(p["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
+                a = agg.setdefault(p["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
                 a["pods"] += 1
                 a["cpu"] += p["cpu_req_m"]
                 a["mem"] += p["mem_req_b"]
+                # host-network pods share the node's own IP, not a distinct pod IP.
+                if not p.get("host_network"):
+                    a["ips"] += 1
             for n in self.model["nodes"]:
                 if selected != "All pools" and n["pool"] != selected:
                     continue
-                a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0})
+                a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
                 req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
                 req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
+                # Pod-IP capacity: k8s has no "IPs remaining" field, so we use
+                # allocatable.pods (kubelet's max-pods, set in build_node_row) as
+                # the node's IP ceiling — AWS VPC CNI derives it from the real
+                # ENI/IP limit, and every other CNI still enforces it as the hard
+                # cap on schedulable pods either way. ip_alloc is None only if the
+                # node object doesn't report allocatable.pods at all.
+                ip_alloc = n.get("pods_alloc")
+                ip_used = a["ips"]
+                ip_left = (ip_alloc - ip_used) if ip_alloc is not None else None
+                ip_used_p = (ip_used / ip_alloc * 100) if ip_alloc else None
                 why = []
                 if req_cpu_p > 85:
                     why.append(f"CPU {req_cpu_p:.0f}% requested")
                 if req_mem_p > 85:
                     why.append(f"mem {req_mem_p:.0f}% requested")
+                if ip_used_p is not None and ip_used_p > 85:
+                    why.append(f"IPs {ip_used_p:.0f}% used ({ip_left} left)")
                 not_ready = n["ready"] != "True"
                 if not_ready:
                     why.append(f"NotReady ({n['ready']})")
@@ -1196,6 +1219,9 @@ class Dashboard(tk.Tk):
                 sev = "crit" if not_ready else ("warn" if why else "")
                 tree.insert("", "end", tags=(sev,), values=(
                     "⧉", n["node"], n["pool"], n["ready"], a["pods"],
+                    ip_used, ip_alloc if ip_alloc is not None else "—",
+                    ip_left if ip_left is not None else "—",
+                    f"{ip_used_p:.0f}%" if ip_used_p is not None else "—",
                     fmt_cpu(n["cpu_alloc_m"]), f"{req_cpu_p:.0f}%",
                     pct(n["cpu_used_m"], n["cpu_alloc_m"]) if n["cpu_used_m"] is not None else "—",
                     fmt_mem(n["mem_alloc_b"]), fmt_mem(a["mem"]), f"{req_mem_p:.0f}%",
@@ -1208,7 +1234,10 @@ class Dashboard(tk.Tk):
         ttk.Label(list_frame, text="Double-click a node for its details, events, and the "
                   "pods running on it — click ⧉ to open in a new window. Red = over 85% "
                   "requested (scheduler sees it as nearly full) or NotReady; see the "
-                  "“⚠ why” column.", padding=4).pack(anchor="w")
+                  "“⚠ why” column. “ip alloc” is the node's max pod-IP capacity "
+                  "(allocatable.pods — on AWS VPC CNI this is the real ENI/IP limit); "
+                  "“ip used” excludes host-network pods, which don't consume one.",
+                  padding=4).pack(anchor="w")
 
         wire_row_actions(
             tree,
