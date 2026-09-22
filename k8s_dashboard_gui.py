@@ -1597,13 +1597,10 @@ class Dashboard(tk.Tk):
         net_note = ttk.Label(
             list_frame, wraplength=900, justify="left", foreground="#555",
             padding=(4, 0, 4, 2),
-            text="How IP figures are calculated: These come straight from the node "
-                 "object and the pod list — nothing is read from any cloud provider "
-                 "(AWS/GCP/Azure). “ip alloc” is the node's allocatable.pods (the "
-                 "kubelet's max-pods cap — the ceiling on pod IPs it can hand out); "
-                 "“ip used” counts pods scheduled on the node that get their own pod "
-                 "IP (host-network pods share the node's IP, so they're excluded); "
-                 "“ip left” and “ip used%” are derived from those two.")
+            text="IP figures come from the node object + pod list, not any cloud "
+                 "provider. “ip alloc” = the node's allocatable.pods (max-pods cap); "
+                 "“ip used” = pods on the node with their own IP (host-network "
+                 "excluded); “ip left”/“ip used%” derive from those.")
 
         def set_view(name):
             view_var.set(name)
