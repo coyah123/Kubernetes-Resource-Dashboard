@@ -182,6 +182,32 @@ def build_model(folder: Path) -> dict:
     })
 
 
+def _container_images(pod: dict) -> list:
+    """Every container image a pod declares — init, app, AND ephemeral — each with
+    its resolved digest (imageID) from the matching *Statuses array when running."""
+    spec = pod.get("spec", {})
+    status = pod.get("status", {})
+    # name -> resolved imageID (the actual pulled digest), across all status arrays.
+    digests = {}
+    for key in ("initContainerStatuses", "containerStatuses",
+                "ephemeralContainerStatuses"):
+        for cs in status.get(key, []) or []:
+            if cs.get("imageID"):
+                digests[cs.get("name")] = cs["imageID"]
+    out = []
+    for ctype, key in (("init", "initContainers"),
+                       ("app", "containers"),
+                       ("ephemeral", "ephemeralContainers")):
+        for c in spec.get(key, []) or []:
+            out.append({
+                "container": c.get("name", "?"), "type": ctype,
+                "image": c.get("image", "—"),
+                "pull": c.get("imagePullPolicy", "—"),
+                "digest": digests.get(c.get("name"), ""),
+            })
+    return out
+
+
 def build_pod_row(p: dict, usage=(None, None)) -> dict:
     """One pod's row dict (the shape every pod table consumes). `usage` is the
     (cpu_millicores, mem_bytes) from metrics-server, or (None, None) if absent."""
@@ -248,6 +274,7 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
         "age": age_from(p["metadata"].get("creationTimestamp")),
         "pod_ip": status.get("podIP", "—"), "status_note": ", ".join(note_parts),
         "host_network": bool(spec.get("hostNetwork", False)),
+        "images": _container_images(p),
         "severity": severity,
         "cpu_req_m": cpu_req, "cpu_lim_m": cpu_lim, "mem_req_b": mem_req, "mem_lim_b": mem_lim,
         "cpu_used_m": usage[0], "mem_used_b": usage[1], "missing_limits": missing,
@@ -280,12 +307,27 @@ def node_pool_from_labels(labels: dict) -> str:
 
 def build_node_row(n: dict, usage=(None, None)) -> dict:
     """One node's row dict: allocatable capacity plus optional live usage."""
-    alloc = n["status"].get("allocatable", {})
-    ready = next((c["status"] for c in n["status"].get("conditions", [])
-                  if c["type"] == "Ready"), "?")
+    meta = n["metadata"]
+    labels = meta.get("labels") or {}
+    status = n.get("status", {})
+    spec = n.get("spec", {})
+    alloc = status.get("allocatable", {})
+    conds = {c["type"]: c["status"] for c in status.get("conditions", [])}
+    ready = conds.get("Ready", "?")
+    # Node "pressure" conditions the kubelet raises when it's starved — any of
+    # these True means the node is unhealthy even if it still reports Ready.
+    pressure = [t.replace("Pressure", "") for t in
+                ("MemoryPressure", "DiskPressure", "PIDPressure")
+                if conds.get(t) == "True"]
+    node_info = status.get("nodeInfo", {})
+    # Taints keep pods off a node unless they tolerate them — worth surfacing
+    # alongside cordon state since both explain "why isn't anything scheduling here".
+    taints = spec.get("taints", []) or []
+    taint_summary = ", ".join(
+        f'{t.get("key")}={t.get("value","")}:{t.get("effect","")}' for t in taints)
     return {
-        "node": n["metadata"]["name"], "ready": ready,
-        "pool": node_pool_from_labels(n["metadata"].get("labels")),
+        "node": meta["name"], "ready": ready,
+        "pool": node_pool_from_labels(labels),
         "cpu_alloc_m": cpu_to_milli(alloc.get("cpu")),
         "mem_alloc_b": mem_to_bytes(alloc.get("memory")),
         "cpu_used_m": usage[0], "mem_used_b": usage[1],
@@ -294,6 +336,18 @@ def build_node_row(n: dict, usage=(None, None)) -> dict:
         # it's computed directly from the instance type's ENI/IP capacity, and on
         # other CNIs it's still the hard cap the scheduler enforces either way.
         "pods_alloc": int(alloc["pods"]) if alloc.get("pods") else None,
+        # spec.unschedulable is exactly what `kubectl cordon` toggles.
+        "schedulable": not spec.get("unschedulable", False),
+        "taints": len(taints), "taint_summary": taint_summary,
+        "pressure": pressure,
+        "age": age_from(meta.get("creationTimestamp")),
+        "version": node_info.get("kubeletVersion", "—"),
+        "os": node_info.get("osImage", "—"),
+        "runtime": node_info.get("containerRuntimeVersion", "—"),
+        "instance_type": (labels.get("node.kubernetes.io/instance-type")
+                          or labels.get("beta.kubernetes.io/instance-type") or "—"),
+        "zone": (labels.get("topology.kubernetes.io/zone")
+                 or labels.get("failure-domain.beta.kubernetes.io/zone") or "—"),
     }
 
 
@@ -860,6 +914,7 @@ class Dashboard(tk.Tk):
         self._build_nodes_tab()
         self._build_deploys_tab()
         self._build_pods_tab()
+        self._build_images_tab()
         self._build_offenders_tab()
         for group in RESOURCE_GROUPS:
             self._build_group_tab(group)
@@ -1158,17 +1213,53 @@ class Dashboard(tk.Tk):
 
         status.pack(side="left", padx=8)
 
-        cols = ("open", "node", "pool", "ready", "pods", "ip used", "ip alloc", "ip left",
-                "ip used%", "cpu alloc", "cpu req%", "cpu used%",
-                "mem alloc", "mem req", "mem req%", "mem used", "mem used%", "⚠ why")
+        # View switcher — same tree/data, but each view shows only its relevant
+        # column group so the table isn't 18 columns wide all at once.
+        view_bar = ttk.Frame(list_frame, padding=(4, 0, 4, 2))
+        view_bar.pack(fill="x")
+        ttk.Label(view_bar, text="View:").pack(side="left")
+
+        cols = ("sel", "open", "node", "pool", "ready", "sched", "pods",
+                "ip used", "ip alloc", "ip left", "ip used%",
+                "cpu alloc", "cpu req%", "cpu used%",
+                "mem alloc", "mem req", "mem req%", "mem used", "mem used%",
+                "taints", "age", "version", "instance", "zone", "os", "runtime", "⚠ why")
         tree = self._make_tree(list_frame, cols,
-                               [40, 150, 130, 70, 55, 65, 65, 65, 75, 90, 80, 80,
-                                90, 90, 80, 90, 80, 200])
+                               [34, 40, 150, 130, 70, 90, 55, 65, 65, 65, 75,
+                                90, 80, 80, 90, 90, 80, 90, 80,
+                                55, 70, 130, 120, 110, 160, 140, 200])
+        tree.heading("sel", text="☑")
         tree.heading("open", text="⧉")
+        tree.column("sel", anchor="center", stretch=False)
         tree.column("open", anchor="center", stretch=False)
         self._wire_cmd_preview(tree, "nodes", "node")
 
+        # Each view is (label, columns shown). "sel"/"open"/"node"/"pool" anchor
+        # every view; the rest are grouped by what question you're asking. "⚠ why"
+        # stays in every view — it's the at-a-glance "is this node ok" flag.
+        anchor = ("sel", "open", "node", "pool")
+        views = {
+            "Health":     anchor + ("ready", "sched", "pods", "taints", "⚠ why"),
+            "Compute":    anchor + ("cpu alloc", "cpu req%", "cpu used%",
+                                    "mem alloc", "mem req", "mem req%", "mem used",
+                                    "mem used%", "⚠ why"),
+            "Networking": anchor + ("pods", "ip used", "ip alloc",
+                                    "ip left", "ip used%", "⚠ why"),
+            "Info":       anchor + ("age", "version", "instance", "zone",
+                                    "os", "runtime", "taints", "⚠ why"),
+        }
+        view_var = tk.StringVar(value="Health")
+
+        def set_view(name):
+            view_var.set(name)
+            tree["displaycolumns"] = views[name]
+
+        for name in views:
+            ttk.Radiobutton(view_bar, text=name, value=name, variable=view_var,
+                            command=lambda n=name: set_view(n)).pack(side="left", padx=2)
+
         def refill():
+            ms.reset()
             for r in tree.get_children(""):
                 tree.delete(r)
 
@@ -1215,10 +1306,18 @@ class Dashboard(tk.Tk):
                 not_ready = n["ready"] != "True"
                 if not_ready:
                     why.append(f"NotReady ({n['ready']})")
-                # NotReady is red (failing); over-provisioning alone is amber.
-                sev = "crit" if not_ready else ("warn" if why else "")
+                for p_cond in n.get("pressure", []):
+                    why.append(f"{p_cond}Pressure")
+                cordoned = not n.get("schedulable", True)
+                if cordoned:
+                    why.append("cordoned")
+                sched_txt = "⛔ cordoned" if cordoned else "✓ sched"
+                # NotReady / kubelet pressure is red (failing); a cordon or plain
+                # over-provisioning is amber (heads-up, not broken).
+                crit = not_ready or n.get("pressure")
+                sev = "crit" if crit else ("warn" if why else "")
                 tree.insert("", "end", tags=(sev,), values=(
-                    "⧉", n["node"], n["pool"], n["ready"], a["pods"],
+                    "☐", "⧉", n["node"], n["pool"], n["ready"], sched_txt, a["pods"],
                     ip_used, ip_alloc if ip_alloc is not None else "—",
                     ip_left if ip_left is not None else "—",
                     f"{ip_used_p:.0f}%" if ip_used_p is not None else "—",
@@ -1227,23 +1326,59 @@ class Dashboard(tk.Tk):
                     fmt_mem(n["mem_alloc_b"]), fmt_mem(a["mem"]), f"{req_mem_p:.0f}%",
                     fmt_mem(n["mem_used_b"]) if n["mem_used_b"] is not None else "—",
                     pct(n["mem_used_b"], n["mem_alloc_b"]) if n["mem_used_b"] is not None else "—",
+                    n.get("taints", 0), n.get("age", "—"), n.get("version", "—"),
+                    n.get("instance_type", "—"), n.get("zone", "—"),
+                    n.get("os", "—"), n.get("runtime", "—"),
                     "; ".join(why),
                 ))
-        refill()
-
-        ttk.Label(list_frame, text="Double-click a node for its details, events, and the "
-                  "pods running on it — click ⧉ to open in a new window. Red = over 85% "
-                  "requested (scheduler sees it as nearly full) or NotReady; see the "
-                  "“⚠ why” column. “ip alloc” is the node's max pod-IP capacity "
-                  "(allocatable.pods — on AWS VPC CNI this is the real ENI/IP limit); "
-                  "“ip used” excludes host-network pods, which don't consume one.",
-                  padding=4).pack(anchor="w")
-
-        wire_row_actions(
+        ms = MultiSelect(
             tree,
             lambda row: ResourceDetailWindow(self, "nodes", tree.set(row, "node"), "", ctx()),
             lambda sel: open_inline_detail(frame, list_frame, "nodes",
                                            tree.set(sel, "node"), "", ctx()))
+        refill()
+        set_view("Health")   # start on the compact health view, not all columns at once
+
+        # -- cordon / uncordon on the checked (or focused) nodes --
+        act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
+        act.pack(fill="x")
+        act_status = ttk.Label(act, text="")
+
+        def _node_targets():
+            # (iid, "nodes", name, "") to match _run_bulk's (iid, ktype, name, ns) shape.
+            return [(i, "nodes", tree.set(i, "node"), "") for i in ms.targets()]
+
+        def _cordon(uncordon):
+            items = _node_targets()
+            if not items:
+                messagebox.showinfo("Nothing selected", "Check node rows, or select one.")
+                return
+            verb = "Uncordon" if uncordon else "Cordon"
+            names = ", ".join(n for _, _, n, _ in items[:5]) + ("…" if len(items) > 5 else "")
+            if not messagebox.askyesno(verb, f"{verb} {len(items)} node(s)?\n\n{names}"):
+                return
+            fn = kubectl_collect.uncordon if uncordon else kubectl_collect.cordon
+            self._run_bulk(items, lambda kt, n, ns: fn(n, context=ctx()),
+                           f"{verb}ed", act_status)
+            # Reflect the new schedulable state without a full cluster round-trip.
+            for i, _, name, _ in items:
+                for m in self.model["nodes"]:
+                    if m["node"] == name:
+                        m["schedulable"] = uncordon
+                if tree.exists(i):
+                    tree.set(i, "sched", "✓ sched" if uncordon else "⛔ cordoned")
+
+        ttk.Button(act, text="⛔ Cordon", command=lambda: _cordon(False)).pack(side="left")
+        ttk.Button(act, text="✓ Uncordon",
+                   command=lambda: _cordon(True)).pack(side="left", padx=4)
+        act_status.pack(side="left", padx=8)
+
+        ttk.Label(list_frame, text="Tick ☑ to select nodes (or click a row), then Cordon "
+                  "(mark unschedulable — running pods stay) / Uncordon. Double-click a node "
+                  "for its details, events, and pods; click ⧉ for a new window. Switch View "
+                  "to see compute, networking, or node info. Red = NotReady or kubelet "
+                  "pressure; amber = cordoned or over 85% requested — see “⚠ why”.",
+                  padding=4).pack(anchor="w")
 
     def _build_deploys_tab(self):
         """Deployments: per-pod and ×replicas reserved footprint, missing
@@ -1578,6 +1713,155 @@ class Dashboard(tk.Tk):
                   "(or just click a row), then Delete. Double-click a pod for details / logs / "
                   "shell; click ⧉ for a new window. Red = failing, amber = running but restarted; "
                   "the “⚠ why” column says why. ⬇ CSV/XLSX exports exactly the rows shown.",
+                  padding=4).pack(anchor="w")
+
+    def _build_images_tab(self):
+        """Images: one row per container image across all pods — init, app, AND
+        ephemeral containers — with the resolved digest. Sourced from pods (the
+        ground truth of what's actually running), filterable by namespace/workload."""
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="Images")
+        self._analysis_frames.append(frame)
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill="both", expand=True)
+        ctx = lambda: self.context_var.get().strip()
+
+        bar = ttk.Frame(list_frame, padding=4)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Namespace:").pack(side="left")
+        namespaces = ["(all)"] + sorted({p["namespace"] for p in self.model["pods"]})
+        ns_var = tk.StringVar(value="(all)")
+        ns_box = ttk.Combobox(bar, textvariable=ns_var, width=20, state="readonly",
+                              values=namespaces)
+        ns_box.pack(side="left", padx=4)
+
+        ttk.Label(bar, text="Type:").pack(side="left", padx=(10, 0))
+        type_var = tk.StringVar(value="(all)")
+        type_box = ttk.Combobox(bar, textvariable=type_var, width=12, state="readonly",
+                                values=["(all)", "init", "app", "ephemeral"])
+        type_box.pack(side="left", padx=4)
+
+        ttk.Label(bar, text="Filter:").pack(side="left", padx=(10, 0))
+        filt = tk.StringVar()
+        ttk.Entry(bar, textvariable=filt, width=26).pack(side="left", padx=4)
+        refresh_status = ttk.Label(bar, text="")
+
+        def do_refresh():
+            ns = ns_var.get()
+            allns = ns == "(all)"
+
+            def fetch():
+                items = kubectl_collect.list_items(
+                    "pods", namespace="" if allns else ns,
+                    all_namespaces=allns, context=ctx())
+                usage = usage_map_from_metrics(kubectl_collect.pod_metrics(ctx()))
+                rows = [build_pod_row(
+                    it, usage.get((it["metadata"]["namespace"], it["metadata"]["name"]),
+                                  (None, None))) for it in items]
+                return (ns, rows)
+
+            def apply(data):
+                scope, rows = data
+                if scope == "(all)":
+                    self.model["pods"] = rows
+                else:
+                    self.model["pods"] = [
+                        p for p in self.model["pods"] if p["namespace"] != scope] + rows
+                refill()
+            self._scoped_refresh(fetch, apply, refresh_status)
+
+        ttk.Button(bar, text="⟳ Refresh images", command=do_refresh).pack(side="left", padx=6)
+        count_lbl = ttk.Label(bar, text="")
+        count_lbl.pack(side="left", padx=8)
+        refresh_status.pack(side="left", padx=4)
+
+        cols = ("open", "namespace", "workload", "pod", "container", "type",
+                "image", "digest", "pull")
+        tree = self._make_tree(list_frame, cols,
+                               [40, 110, 180, 200, 150, 80, 320, 170, 100])
+        tree.heading("open", text="⧉")
+        tree.column("open", anchor="center", stretch=False)
+        self._wire_cmd_preview(tree, "pods", "pod", "namespace")
+
+        def short_digest(d):
+            # imageID is like "repo@sha256:<64 hex>" (or bare "sha256:…") — the tag
+            # is already in the image column, so show just the pinned digest, short.
+            if not d:
+                return "—"
+            if "@sha256:" in d:
+                return "sha256:" + d.split("@sha256:", 1)[1][:12]
+            if d.startswith("sha256:"):
+                return d[:19]
+            return d
+
+        # init containers run-then-exit; ephemeral are debug attachments — tint both
+        # so they're distinguishable from the app containers at a glance.
+        tree.tag_configure("init", foreground="#8fb3ff")
+        tree.tag_configure("ephemeral", foreground="#c58fff")
+
+        def refill(*_):
+            for r in tree.get_children(""):
+                tree.delete(r)
+            q = filt.get().lower()
+            ns = ns_var.get()
+            typ = type_var.get()
+            n_rows = 0
+            uniq = set()
+            pods_seen = set()
+            for p in sorted(self.model["pods"], key=lambda x: (x["namespace"], x["pod"])):
+                if ns != "(all)" and p["namespace"] != ns:
+                    continue
+                for img in p.get("images", []):
+                    if typ != "(all)" and img["type"] != typ:
+                        continue
+                    hay = (f'{p["namespace"]} {p["owner"]} {p["pod"]} '
+                           f'{img["container"]} {img["image"]}').lower()
+                    if q and q not in hay:
+                        continue
+                    tag = img["type"] if img["type"] in ("init", "ephemeral") else ""
+                    tree.insert("", "end", tags=(tag,), values=(
+                        "⧉", p["namespace"], p["owner"], p["pod"], img["container"],
+                        img["type"], img["image"], short_digest(img["digest"]), img["pull"]))
+                    n_rows += 1
+                    uniq.add(img["image"])
+                    pods_seen.add((p["namespace"], p["pod"]))
+            count_lbl.config(
+                text=f"{n_rows} containers · {len(uniq)} unique images · {len(pods_seen)} pods")
+
+        ns_box.bind("<<ComboboxSelected>>", refill)
+        type_box.bind("<<ComboboxSelected>>", refill)
+        filt.trace_add("write", refill)
+        refill()
+
+        # Lazily pull pods the first time this tab is shown if we have none yet
+        # (a fresh live session may not have loaded pods), once per context.
+        _probe = {"ctx": None}
+
+        def ensure_pods(*_):
+            if self.model["pods"]:
+                return
+            ctx0 = ctx()
+            if not ctx0 or _probe["ctx"] == ctx0:
+                return
+            _probe["ctx"] = ctx0
+            do_refresh()
+
+        frame.bind("<Map>", ensure_pods, add="+")
+
+        wire_row_actions(
+            tree,
+            lambda row: ResourceDetailWindow(self, "pod", tree.set(row, "pod"),
+                                             tree.set(row, "namespace"), ctx()),
+            lambda sel: open_inline_detail(frame, list_frame, "pod",
+                                           tree.set(sel, "pod"),
+                                           tree.set(sel, "namespace"), ctx()))
+
+        ttk.Label(list_frame, text="One row per container image across all pods — includes "
+                  "init (blue) and ephemeral/debug (purple) containers, not just app "
+                  "containers. “image” is the declared tag; “digest” is the resolved sha256 "
+                  "actually pulled (blank until the container has started). Filter by "
+                  "Namespace / Type / free text (matches image, container, pod, workload). "
+                  "Double-click to open the owning pod; ⬇ CSV/XLSX exports the rows shown.",
                   padding=4).pack(anchor="w")
 
     def _build_group_tab(self, group):

@@ -76,7 +76,18 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
   vs requested vs used) for CPU and memory, and the biggest memory offenders
 - **Nodes** — requested % vs used % per node, plus pod-IP capacity (**ip used /
   ip alloc / ip left**, see **Pod-IP capacity** below); open a node for its
-  details, events, and the pods running on it
+  details, events, and the pods running on it. A **View** switcher keeps the wide
+  table readable — **Health** (ready / schedulable / taints), **Compute** (CPU &
+  memory), **Networking** (pod-IP capacity), and **Info** (k8s version, instance
+  type, zone, OS, container runtime, age) — with the **⚠ why** flag in every view.
+  **Tick ☑ rows to bulk Cordon / Uncordon** nodes; red = NotReady or kubelet
+  pressure (Memory/Disk/PID), amber = cordoned or over 85% requested
+- **Images** — one row per container image across **all pods**, including **init**
+  and **ephemeral/debug** containers (not just app containers), each with its
+  resolved **sha256 digest** (what actually got pulled). Filter by namespace, type
+  (init / app / ephemeral), or free text (matches image, container, pod, or
+  workload); double-click to open the owning pod. Sourced from pods — the ground
+  truth of what's running
 - **Deployments** — filter by namespace; per-pod and total (×replicas) reserved
   footprint; open a deployment for its YAML, events, and the pods it manages;
   **tick ☑ rows to bulk rollout-restart or delete**
@@ -124,6 +135,8 @@ Rows across the app share one interaction model:
   single selected row if none are checked), each behind a confirmation:
   - **Pods** → **Delete** (managed pods get recreated by their controller)
   - **Deployments** → **Rollout restart** and **Delete**
+  - **Nodes** → **Cordon** (mark unschedulable — running pods stay put) and
+    **Uncordon**
 
 A resource's detail view has tabs for **Describe**, **YAML**, and **Events**.
 Pods additionally get **Logs (live)** — a real-time `kubectl logs -f` stream with
@@ -323,10 +336,27 @@ kubectl get pods -A -o wide
 kubectl describe node <node>     # "Allocated resources" = requested % of capacity
 ```
 
-**Nodes** — capacity/allocatable per node (the Nodes tab):
+**Nodes** — capacity/allocatable per node, plus schedulable state, taints, kubelet
+conditions, and `nodeInfo` (version / OS / runtime) for the Nodes tab's views:
 
 ```bash
 kubectl get nodes -o json
+```
+
+The Nodes tab's **Cordon / Uncordon** buttons are the only node mutations, each
+behind a confirmation:
+
+```bash
+kubectl cordon <node>      # mark unschedulable (spec.unschedulable=true)
+kubectl uncordon <node>    # mark schedulable again
+```
+
+**Images** — the Images tab reads the same `kubectl get pods -A -o json` above and
+walks each pod's `initContainers`, `containers`, and `ephemeralContainers`, pairing
+declared images with the resolved digest from the matching `*Statuses[].imageID`:
+
+```bash
+kubectl get pods -A -o jsonpath='{range .items[*]}{range .spec.initContainers[*]}{.image}{"\n"}{end}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | sort -u
 ```
 
 ### Pod-IP capacity (Nodes tab: "ip used" / "ip alloc" / "ip left" / "ip used%")

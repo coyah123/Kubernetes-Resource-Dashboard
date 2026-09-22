@@ -324,6 +324,16 @@ def rollout_restart(ktype: str, name: str, *, namespace: str = "",
     return _run(args, context=context)
 
 
+def cordon(name: str, *, context: str = "") -> str:
+    """Mark a node unschedulable (spec.unschedulable=true). Running pods stay put."""
+    return _run(["cordon", name], context=context)
+
+
+def uncordon(name: str, *, context: str = "") -> str:
+    """Mark a node schedulable again (clears spec.unschedulable)."""
+    return _run(["uncordon", name], context=context)
+
+
 def delete(ktype: str, name: str, *, namespace: str = "", context: str = "") -> str:
     args = ["delete", ktype, name]
     if namespace:
