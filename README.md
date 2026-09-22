@@ -92,7 +92,10 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
   footprint; open a deployment for its YAML, events, and the pods it manages;
   **tick ☑ rows to bulk rollout-restart or delete**
 - **Pods** — filter; open a pod for describe / YAML / events / **live logs** /
-  embedded **shell**; **tick ☑ rows to bulk delete** (see below)
+  embedded **shell**; **tick ☑ rows to bulk delete** (see below). Pods hit by a
+  **Multi-Attach volume error** are flagged red with the reason in **⚠ why**, and
+  a **Reconcile Multi-Attach…** button diagnoses and clears the standoff (see
+  **Multi-Attach detection & reconcile** below)
 - **Pods by namespace** — pick a namespace, browse its pods, open any one, or
   **tick ☑ to bulk delete**
 - **Workloads / Networking / Config / Storage / Security / RBAC** — browse (almost)
@@ -101,6 +104,9 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
   rollout restart / delete). **Security / RBAC** covers ServiceAccounts, Roles,
   ClusterRoles, RoleBindings and ClusterRoleBindings (with a ⚠ flag on wildcard
   rules); ClusterRoleBindings can be filtered by their subjects' namespace.
+  **Storage** additionally lists **VolumeAttachments** (which PV is attached to
+  which node) — rows carrying an **attachError** turn red — and offers
+  **Reconcile Multi-Attach…** on a selected **PVC** (see below).
 - **Custom Resources** — discovers **every CRD installed in the cluster** at refresh
   (cert-manager, Argo, Gateway API, NGINX VirtualServers/TransportServers, …) and
   lets you browse instances of any of them, using each CRD's own
@@ -133,7 +139,8 @@ Rows across the app share one interaction model:
 - On the Pods and Deployments tabs, a leading **☑ column** lets you check several
   rows; the buttons below the table then act on **all checked rows** (or the
   single selected row if none are checked), each behind a confirmation:
-  - **Pods** → **Delete** (managed pods get recreated by their controller)
+  - **Pods** → **Delete** (managed pods get recreated by their controller), plus
+    **Reconcile Multi-Attach…** on a single stuck pod
   - **Deployments** → **Rollout restart** and **Delete**
   - **Nodes** → **Cordon** (mark unschedulable — running pods stay put) and
     **Uncordon**
@@ -209,6 +216,11 @@ urgent):
 - **Pods** and **Pods by namespace** — the pod is unhealthy (not
   Running/Succeeded, a container reason like `CrashLoopBackOff`/`ImagePullBackOff`,
   or restarts). The **⚠ why** column gives the exact reason for every red row.
+  This includes a **Multi-Attach volume error** (a pod Event, normally invisible
+  in the pod object) — see **Multi-Attach detection & reconcile** below.
+- **Storage → VolumeAttachments** — the attachment reports an **attachError**
+  (or detachError): the CSI/attach-detach controller couldn't (de)attach the
+  volume, the cluster-side face of a Multi-Attach standoff.
 
 Missing requests/limits are still surfaced, just not in red: the **Deployments**
 tab lists the exact gaps in its **"missing"** column (e.g. `web:cpu-lim`), the
@@ -461,6 +473,71 @@ kubectl get node <node> -o jsonpath='{.status.allocatable.pods}'
 kubectl get pods -A --field-selector spec.nodeName=<node> -o json \
   | jq '[.items[] | select(.spec.hostNetwork != true)] | length'
 ```
+
+### Multi-Attach detection & reconcile (Pods tab + Storage tab)
+
+A **`Multi-Attach error for volume …`** happens when a **ReadWriteOnce** (RWO)
+PVC is still attached to a pod on one node while a new pod tries to mount it on
+another node. RWO means "mountable by one node at a time," so the second mount
+can't proceed until the first releases. The classic trigger is a node
+drain/crash/upgrade: the old pod gets stuck `Terminating`, its **VolumeAttachment**
+never releases, and the replacement pod hangs in `ContainerCreating`/`Pending`
+indefinitely. (ReadWriteMany volumes can't hit this — they're legitimately
+mounted on many nodes at once, so the tool ignores them here.)
+
+**Why the app has to work for this.** The failure surfaces as a **pod Event**
+(`FailedAttachVolume` / `FailedMount` with a "Multi-Attach" message), *not* as a
+container `waiting.reason`. A plain `kubectl get pods` just shows
+`ContainerCreating` — the real cause is hidden. So the dashboard reads Events to
+make it visible, and correlates several objects to point at the actual fix.
+
+**1. Detect (Pods tab).** On each Pods refresh, alongside `kubectl get pods` the
+app also fetches Events in the same scope and scans them for the attach/mount
+failures. Any match tags the affected pod with a note (e.g. *"Multi-Attach (PVC
+held elsewhere)"*) in the **⚠ why** column and forces the row **red**, even
+though the pod's phase is only `Pending`. This is best-effort: if listing Events
+is denied or errors, the pod table still renders normally.
+
+```bash
+kubectl get events -A -o json      # scanned for reason FailedAttachVolume / FailedMount
+```
+
+**2. Analyze.** When you select a stuck pod (Pods tab) or its PVC (Storage tab)
+and click **Reconcile Multi-Attach…**, the app builds the dependency graph that
+identifies *what is holding the volume*:
+
+```bash
+kubectl get pod <pod> -n <ns> -o json          # the stuck pod → its RWO PVCs + target node
+kubectl get pvc -n <ns> -o json                # each PVC → its PV + access modes (RWO only)
+kubectl get volumeattachments -o json          # which PV is attached to which node (the holder)
+kubectl get pods -n <ns> -o json               # the pod on the holder node still mounting that PVC
+```
+
+The chain is: **stuck pod → RWO PVC → PV → VolumeAttachment on a *different*
+node → the stale pod on that node**. The stale pod (usually the old one stuck
+Terminating) is the real thing to remove to free the volume; the VolumeAttachment
+is the fallback target if that pod is already gone but the attachment lingers.
+
+**3. Reconcile.** A dialog shows exactly what's holding each volume — the PVC/PV,
+the holder node(s), the VolumeAttachment name(s), and the stale pod(s) — then
+offers two **destructive, individually-confirmed** fixes:
+
+```bash
+kubectl delete pod <stale-pod> -n <ns> --force --grace-period=0   # free the volume (usual fix)
+kubectl delete volumeattachment <name>                            # last resort: orphaned attachment
+```
+
+> ⚠ **Safety.** Force-deleting a pod (or deleting a VolumeAttachment) assumes the
+> old node is genuinely gone. Doing it while the volume is *still mounted* on a
+> live node can corrupt data. The dialog never acts on its own — each button
+> requires a separate confirmation and names precisely what it will remove. This
+> is the one place the "read-mostly" tool takes a genuinely disruptive action, so
+> it's deliberately behind an explicit diagnosis screen.
+
+**Two entry points, one engine.** The Pods tab starts from the *symptom* (the red
+pod); the Storage tab starts from the *resource* (the PVC, or you can eyeball the
+red VolumeAttachment rows first). Both converge on the same analysis and dialog,
+so the diagnosis and the safety gates are identical either way.
 
 **Actual usage (metrics-server)** — real live CPU/memory. `kubectl top` has no JSON
 output, so the app hits the raw metrics API. If metrics-server isn't installed these

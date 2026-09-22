@@ -34,6 +34,27 @@ How this file is organized (top to bottom, follow the `# ---` banners):
 Threading rule of thumb: kubectl never runs on the UI thread. Each screen kicks
 work onto a daemon thread that drops results on a queue.Queue, and an after()
 timer on the UI thread drains that queue to update widgets.
+
+Multi-Attach detection & reconcile (spans several sections — map for readers):
+  A "Multi-Attach error for volume" happens when a ReadWriteOnce PVC is still
+  attached to a pod on one node while a new pod tries to mount it on another —
+  classically after a node drain/crash leaves the old pod stuck Terminating so
+  its VolumeAttachment never releases, and the replacement pod hangs. The error
+  is a pod *Event*, not a container waiting reason, so it's invisible in the pod
+  object alone. The feature has three cooperating parts:
+    • Detect — scan_volume_attach_issues() reads Events; the Pods tab fetches
+      Events alongside pods and feeds build_pod_row(attach_issue=...), which puts
+      the note in "⚠ why" and forces crit (red).
+    • Analyze — analyze_multi_attach() (pure/UI-free, so it's unit-testable) walks
+      stuck pod → RWO PVC → PV → VolumeAttachment on another node → the stale pod
+      pinning it there. It returns the action targets (stale pods / attachments).
+    • Reconcile — Dashboard._show_multi_attach_dialog() presents the finding and
+      offers the two guarded, destructive fixes (force-delete the stale pod;
+      delete the orphaned VolumeAttachment). Entry points: the Pods tab (from the
+      stuck pod) and the Storage tab (from a PVC, via
+      _reconcile_multi_attach_for_pvc, which first locates the stuck pod). The
+      Storage browser also lists VolumeAttachments and reds any with an
+      attachError via the Kind.severity hook.
 """
 from __future__ import annotations
 
@@ -208,9 +229,129 @@ def _container_images(pod: dict) -> list:
     return out
 
 
-def build_pod_row(p: dict, usage=(None, None)) -> dict:
+# Event reasons the kubelet / attach-detach controller raise when a pod can't
+# get its volume — the visible symptom of a Multi-Attach standoff (an RWO PVC
+# still attached to a pod on another node). These are pod *Events*, not container
+# waiting reasons, so build_pod_row can't see them from the pod object alone.
+_VOLUME_ATTACH_REASONS = ("FailedAttachVolume", "FailedMount")
+
+
+def scan_volume_attach_issues(events: list[dict]) -> dict:
+    """Map (namespace, pod) -> short note for pods hitting a volume-attach failure.
+
+    Scans an Event list (`kubectl get events`) for the attach/mount failures that
+    signal a Multi-Attach standoff. Multi-Attach messages get the pointed
+    'held elsewhere' note; other attach/mount failures get a generic one.
+    """
+    out = {}
+    for ev in events:
+        if ev.get("reason") not in _VOLUME_ATTACH_REASONS:
+            continue
+        obj = ev.get("involvedObject", {}) or {}
+        if obj.get("kind") != "Pod" or not obj.get("name"):
+            continue
+        msg = ev.get("message", "") or ""
+        note = ("Multi-Attach (PVC held elsewhere)"
+                if "Multi-Attach" in msg else "volume attach/mount failing")
+        key = (obj.get("namespace", ""), obj["name"])
+        # Prefer the Multi-Attach note if any event for the pod carries it.
+        if key not in out or note.startswith("Multi-Attach"):
+            out[key] = note
+    return out
+
+
+# RWO access modes are the only ones that can cause a Multi-Attach standoff —
+# ReadWriteMany volumes are legitimately mounted on many nodes at once.
+_RWO_MODES = {"ReadWriteOnce", "ReadWriteOncePod"}
+
+
+def _pod_pvc_names(pod: dict) -> list[str]:
+    """The PVC names a pod mounts (spec.volumes[*].persistentVolumeClaim)."""
+    out = []
+    for v in pod.get("spec", {}).get("volumes", []) or []:
+        claim = (v.get("persistentVolumeClaim") or {}).get("claimName")
+        if claim:
+            out.append(claim)
+    return out
+
+
+def analyze_multi_attach(pod: dict, pvcs: list[dict], vol_attachments: list[dict],
+                         all_pods: list[dict]) -> dict:
+    """Work out what's holding a stuck pod's RWO volume(s) on another node.
+
+    Pure/UI-free so it's testable: callers pass the already-fetched pod object,
+    the namespace's PVCs, the cluster's VolumeAttachments, and the pod list.
+
+    Returns {target_node, volumes: [...], stale_pods: [...], attachments: [...]}
+    where each ``volumes`` entry names the PVC/PV, the node(s) still holding it,
+    the VolumeAttachment object(s) pinning it there, and the pod(s) on those nodes
+    that mount it (the thing to delete to free the volume). ``stale_pods`` and
+    ``attachments`` are the flattened, de-duplicated action targets.
+    """
+    target_node = pod.get("spec", {}).get("nodeName", "")
+    ns = pod.get("metadata", {}).get("namespace", "")
+    wanted = set(_pod_pvc_names(pod))
+    # PVC name -> (pv name, access modes) for the RWO claims this pod wants.
+    pvc_pv = {}
+    for c in pvcs:
+        name = c.get("metadata", {}).get("name")
+        if name not in wanted:
+            continue
+        modes = set(c.get("spec", {}).get("accessModes", []) or [])
+        if modes & _RWO_MODES:
+            pvc_pv[name] = (c.get("spec", {}).get("volumeName", ""), modes)
+
+    # PV name -> [(node, VA name)] for attachments pinned to some OTHER node.
+    pv_holders = {}
+    for va in vol_attachments:
+        src = (va.get("spec", {}).get("source") or {})
+        pv = src.get("persistentVolumeName")
+        node = va.get("spec", {}).get("nodeName", "")
+        attached = va.get("status", {}).get("attached", False)
+        if pv and attached and node and node != target_node:
+            pv_holders.setdefault(pv, []).append(
+                (node, va.get("metadata", {}).get("name", "")))
+
+    volumes, stale_pods, attachments = [], {}, {}
+    for pvc, (pv, modes) in pvc_pv.items():
+        holders = pv_holders.get(pv, [])
+        if not holders:
+            continue
+        holder_nodes = {n for n, _ in holders}
+        va_names = [va for _, va in holders if va]
+        # Pods on a holder node that mount this same PVC are the real thing to
+        # delete — usually the old pod stuck Terminating after a node went away.
+        pvc_stale = []
+        for op in all_pods:
+            om, osp = op.get("metadata", {}), op.get("spec", {})
+            if om.get("namespace") != ns or pvc not in _pod_pvc_names(op):
+                continue
+            onode = osp.get("nodeName", "")
+            if onode in holder_nodes and om.get("name") != pod.get("metadata", {}).get("name"):
+                phase = op.get("status", {}).get("phase", "?")
+                pvc_stale.append((om["name"], onode, phase))
+                stale_pods[(ns, om["name"])] = onode
+        for va in va_names:
+            attachments[va] = holder_nodes
+        volumes.append({
+            "pvc": pvc, "pv": pv, "modes": sorted(modes),
+            "holder_nodes": sorted(holder_nodes),
+            "attachments": va_names, "stale_pods": pvc_stale,
+        })
+    return {
+        "target_node": target_node,
+        "volumes": volumes,
+        "stale_pods": [(ns, n) for (ns, n) in stale_pods],
+        "attachments": sorted(attachments),
+    }
+
+
+def build_pod_row(p: dict, usage=(None, None), attach_issue: str = "") -> dict:
     """One pod's row dict (the shape every pod table consumes). `usage` is the
-    (cpu_millicores, mem_bytes) from metrics-server, or (None, None) if absent."""
+    (cpu_millicores, mem_bytes) from metrics-server, or (None, None) if absent.
+    `attach_issue` is a volume attach/mount note from scan_volume_attach_issues
+    (a pod Event, invisible in the pod object) — appended to the note and forcing
+    crit severity so a stuck-mounting pod shows red even while phase is Pending."""
     ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
     spec = p.get("spec", {})
     status = p.get("status", {})
@@ -262,7 +403,9 @@ def build_pod_row(p: dict, usage=(None, None)) -> dict:
     # Severity for row coloring: "crit" = actively failing (bad phase, or a
     # container stuck/crashed), "warn" = running but restarted *recently* (flapping
     # now), "" = healthy. Old restarts from a long-ago node drain don't earn a color.
-    if phase not in ("Running", "Succeeded") or reasons:
+    if attach_issue:
+        note_parts.append(attach_issue)
+    if phase not in ("Running", "Succeeded") or reasons or attach_issue:
         severity = "crit"
     elif restarted_recently:
         severity = "warn"
@@ -1070,6 +1213,205 @@ class Dashboard(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _reconcile_multi_attach(self, ns, pod, context, status_lbl, on_done=None):
+        """Diagnose and offer to break a Multi-Attach standoff for one pod.
+
+        Off-thread, gather the pod + its namespace PVCs + cluster VolumeAttachments
+        + namespace pods, run analyze_multi_attach, then present a dialog naming
+        exactly what's holding each RWO volume and on which node. The fixes are
+        destructive (force-deleting the stale pod / deleting a VolumeAttachment),
+        so nothing acts without an explicit click in that dialog.
+        """
+        status_lbl.config(text="⏳ diagnosing Multi-Attach…")
+
+        def work():
+            try:
+                pod_obj = kubectl_collect.get_item(
+                    "pod", pod, namespace=ns, context=context)
+                pvcs = kubectl_collect.list_items(
+                    "pvc", namespace=ns, context=context)
+                vas = kubectl_collect.list_items(
+                    "volumeattachments", context=context)
+                all_pods = kubectl_collect.list_items(
+                    "pods", namespace=ns, context=context)
+                report = analyze_multi_attach(pod_obj, pvcs, vas, all_pods)
+            except Exception as e:  # noqa: BLE001
+                self.after(0, lambda err=e: status_lbl.config(text=f"⚠ {err}"))
+                return
+            self.after(0, lambda: self._show_multi_attach_dialog(
+                ns, pod, report, context, status_lbl, on_done))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_multi_attach_dialog(self, ns, pod, report, context, status_lbl,
+                                  on_done=None):
+        """The reconcile dialog: what's holding the volume, and the two fixes."""
+        status_lbl.config(text="")
+        volumes = report.get("volumes", [])
+        if not volumes:
+            messagebox.showinfo(
+                "No Multi-Attach holder found",
+                f"{ns}/{pod}: none of its RWO volumes are attached on another "
+                "node right now.\n\nEither the volume already detached (try a "
+                "refresh), the PVC is ReadWriteMany (Multi-Attach doesn't apply), "
+                "or the block is something else — check the pod's Events.")
+            if on_done:
+                on_done()
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Reconcile Multi-Attach — {ns}/{pod}")
+        win.transient(self)
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, justify="left", wraplength=680, text=(
+            f"Pod {ns}/{pod} is waiting for volume(s) that a controller still has "
+            f"attached to another node (target node: "
+            f"{report.get('target_node') or '<unscheduled>'}). Free the volume by "
+            "removing whatever holds it — normally the old pod stuck Terminating "
+            "on that node.")).pack(anchor="w", pady=(0, 8))
+
+        report_txt = tk.Text(frm, height=12, width=84, wrap="word")
+        report_txt.pack(fill="both", expand=True)
+        for v in volumes:
+            report_txt.insert("end", f"PVC {v['pvc']}  ({'/'.join(v['modes'])})\n")
+            report_txt.insert("end", f"  PV: {v['pv']}\n")
+            report_txt.insert("end",
+                              f"  held on node(s): {', '.join(v['holder_nodes'])}\n")
+            if v["attachments"]:
+                report_txt.insert("end",
+                                  f"  VolumeAttachment(s): {', '.join(v['attachments'])}\n")
+            if v["stale_pods"]:
+                for name, onode, phase in v["stale_pods"]:
+                    report_txt.insert(
+                        "end", f"  stale pod: {name} on {onode} ({phase})\n")
+            else:
+                report_txt.insert(
+                    "end", "  no pod on the holder node mounts this PVC — the "
+                    "attachment itself is orphaned.\n")
+            report_txt.insert("end", "\n")
+        report_txt.config(state="disabled")
+
+        warn = ("⚠ Force-deleting a pod, or deleting a VolumeAttachment, assumes "
+                "the old node is truly gone. Doing this while the volume is still "
+                "genuinely mounted can corrupt data.")
+        ttk.Label(frm, justify="left", wraplength=680, foreground="#a33",
+                  text=warn).pack(anchor="w", pady=(4, 8))
+
+        stale_pods = report.get("stale_pods", [])
+        attachments = report.get("attachments", [])
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+
+        def _after_action():
+            win.destroy()
+            if on_done:
+                on_done()
+
+        def force_delete_pods():
+            if not stale_pods:
+                return
+            names = ", ".join(n for _, n in stale_pods)
+            if not messagebox.askyesno(
+                    "Force-delete stale pod(s)", parent=win,
+                    icon="warning",
+                    message=f"Force-delete {len(stale_pods)} pod(s) holding the "
+                            f"volume?\n\n{names}\n\nUses --force --grace-period=0."):
+                return
+            items = [(f"{n}", "pod", n, pns) for pns, n in stale_pods]
+            self._run_bulk(
+                items,
+                lambda kt, n, pns: kubectl_collect.delete(
+                    kt, n, namespace=pns, context=context, force=True),
+                "Force-deleted", status_lbl)
+            _after_action()
+
+        def delete_attachments():
+            if not attachments:
+                return
+            if not messagebox.askyesno(
+                    "Delete VolumeAttachment(s)", parent=win, icon="warning",
+                    message=f"Delete {len(attachments)} VolumeAttachment(s)?\n\n"
+                            f"{', '.join(attachments)}\n\nLast resort — only if the "
+                            "holder pod is already gone but the attachment lingers."):
+                return
+            items = [(va, "volumeattachment", va, "") for va in attachments]
+            self._run_bulk(
+                items,
+                lambda kt, n, _ns: kubectl_collect.delete(kt, n, context=context),
+                "Deleted attachment", status_lbl)
+            _after_action()
+
+        b1 = ttk.Button(
+            btns, text=f"Force-delete stale pod(s) ({len(stale_pods)})",
+            command=force_delete_pods)
+        b1.pack(side="left")
+        if not stale_pods:
+            b1.state(["disabled"])
+        b2 = ttk.Button(
+            btns, text=f"Delete VolumeAttachment(s) ({len(attachments)})",
+            command=delete_attachments)
+        b2.pack(side="left", padx=6)
+        if not attachments:
+            b2.state(["disabled"])
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
+    def _reconcile_multi_attach_for_pvc(self, ns, pvc, context, status_lbl,
+                                        on_done=None):
+        """Storage-tab entry point: reconcile Multi-Attach starting from a PVC.
+
+        The reconcile analysis is pod-centric (it needs the *stuck* pod), so this
+        first finds the pod that mounts ``pvc`` but sits on a node other than the
+        one still holding the volume, then hands off to the shared dialog.
+        """
+        status_lbl.config(text="⏳ diagnosing Multi-Attach…")
+
+        def work():
+            try:
+                pvcs = kubectl_collect.list_items("pvc", namespace=ns, context=context)
+                vas = kubectl_collect.list_items("volumeattachments", context=context)
+                all_pods = kubectl_collect.list_items(
+                    "pods", namespace=ns, context=context)
+                pv = next((c.get("spec", {}).get("volumeName", "")
+                           for c in pvcs
+                           if c.get("metadata", {}).get("name") == pvc), "")
+                holder_nodes = {
+                    va.get("spec", {}).get("nodeName", "")
+                    for va in vas
+                    if (va.get("spec", {}).get("source") or {}).get(
+                        "persistentVolumeName") == pv
+                    and va.get("status", {}).get("attached")
+                    and va.get("spec", {}).get("nodeName")}
+                # The stuck pod is one mounting this PVC on a node that isn't the
+                # holder (the replacement that can't attach). Prefer a Pending one.
+                candidates = [p for p in all_pods if pvc in _pod_pvc_names(p)
+                              and p.get("spec", {}).get("nodeName", "") not in holder_nodes]
+                stuck = next((p for p in candidates
+                              if p.get("status", {}).get("phase") == "Pending"),
+                             candidates[0] if candidates else None)
+                if stuck is None:
+                    def none_found():
+                        status_lbl.config(text="")
+                        messagebox.showinfo(
+                            "No stuck pod found",
+                            f"No pod is waiting on {ns}/{pvc} from a different node "
+                            "than the one holding it. If a pod is stuck, refresh and "
+                            "reconcile it from the Pods tab instead.")
+                        if on_done:
+                            on_done()
+                    self.after(0, none_found)
+                    return
+                report = analyze_multi_attach(stuck, pvcs, vas, all_pods)
+                stuck_name = stuck.get("metadata", {}).get("name", "")
+            except Exception as e:  # noqa: BLE001
+                self.after(0, lambda err=e: status_lbl.config(text=f"⚠ {err}"))
+                return
+            self.after(0, lambda: self._show_multi_attach_dialog(
+                ns, stuck_name, report, context, status_lbl, on_done))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _node_usage_map(self, context):
         """{node name -> (cpu millicores, mem bytes)} live from metrics-server."""
         nu = {}
@@ -1250,9 +1592,26 @@ class Dashboard(tk.Tk):
         }
         view_var = tk.StringVar(value="Health")
 
+        # Networking-only note: explains the IP columns are derived locally from
+        # the node object + pod list, not any cloud API. Shown only in that view.
+        net_note = ttk.Label(
+            list_frame, wraplength=900, justify="left", foreground="#555",
+            padding=(4, 0, 4, 2),
+            text="How IP figures are calculated: These come straight from the node "
+                 "object and the pod list — nothing is read from any cloud provider "
+                 "(AWS/GCP/Azure). “ip alloc” is the node's allocatable.pods (the "
+                 "kubelet's max-pods cap — the ceiling on pod IPs it can hand out); "
+                 "“ip used” counts pods scheduled on the node that get their own pod "
+                 "IP (host-network pods share the node's IP, so they're excluded); "
+                 "“ip left” and “ip used%” are derived from those two.")
+
         def set_view(name):
             view_var.set(name)
             tree["displaycolumns"] = views[name]
+            if name == "Networking":
+                net_note.pack(fill="x", after=view_bar)
+            else:
+                net_note.pack_forget()
 
         for name in views:
             ttk.Radiobutton(view_bar, text=name, value=name, variable=view_var,
@@ -1563,9 +1922,22 @@ class Dashboard(tk.Tk):
                     "pods", namespace="" if allns else ns,
                     all_namespaces=allns, context=ctx())
                 usage = usage_map_from_metrics(kubectl_collect.pod_metrics(ctx()))
+                # Volume attach/mount failures are pod Events, not visible in the
+                # pod object — fetch them in the same scope to flag Multi-Attach.
+                # Best-effort: a permissions/API hiccup shouldn't blank the table.
+                try:
+                    events = kubectl_collect.list_items(
+                        "events", namespace="" if allns else ns,
+                        all_namespaces=allns, context=ctx())
+                    attach = scan_volume_attach_issues(events)
+                except Exception:  # noqa: BLE001
+                    attach = {}
                 rows = [build_pod_row(
                     it, usage.get((it["metadata"]["namespace"], it["metadata"]["name"]),
-                                  (None, None))) for it in items]
+                                  (None, None)),
+                    attach_issue=attach.get(
+                        (it["metadata"]["namespace"], it["metadata"]["name"]), ""))
+                    for it in items]
                 return (ns, rows)
 
             def apply(data):
@@ -1705,14 +2077,31 @@ class Dashboard(tk.Tk):
                 kt, n, namespace=ns, context=ctx()), "Deleted", act_status,
                 tree=tree, remove_on_success=True)
 
+        def do_reconcile():
+            targets = list(ms.targets())
+            if len(targets) != 1:
+                messagebox.showinfo(
+                    "Select one pod",
+                    "Pick the single stuck pod (the one showing a Multi-Attach / "
+                    "volume attach failure) to reconcile.")
+                return
+            i = targets[0]
+            self._reconcile_multi_attach(
+                tree.set(i, "namespace"), tree.set(i, "pod"), ctx(), act_status,
+                on_done=do_refresh)
+
         ttk.Button(act, text="Delete…", command=do_delete).pack(side="left")
+        ttk.Button(act, text="Reconcile Multi-Attach…",
+                   command=do_reconcile).pack(side="left", padx=4)
         act_status.pack(side="left", padx=8)
 
         ttk.Label(list_frame, text="Filter by Namespace, Nodepool, and/or Node (the Node list "
                   "narrows to the chosen pool), and/or type in Filter. Tick ☑ to select multiple "
                   "(or just click a row), then Delete. Double-click a pod for details / logs / "
                   "shell; click ⧉ for a new window. Red = failing, amber = running but restarted; "
-                  "the “⚠ why” column says why. ⬇ CSV/XLSX exports exactly the rows shown.",
+                  "the “⚠ why” column says why. A pod stuck on “Multi-Attach” means its RWO "
+                  "volume is still held on another node — select it and “Reconcile Multi-Attach…” "
+                  "to find and free the holder. ⬇ CSV/XLSX exports exactly the rows shown.",
                   padding=4).pack(anchor="w")
 
     def _build_images_tab(self):
@@ -1870,8 +2259,13 @@ class Dashboard(tk.Tk):
         frame = ttk.Frame(self.nb)
         self.nb.add(frame, text=group)
         self._analysis_frames.append(frame)
+        # The Multi-Attach reconcile action only applies to PVCs (Storage group).
+        on_reconcile = (self._reconcile_multi_attach_for_pvc
+                        if any(k.reconcilable for k in RESOURCE_GROUPS[group])
+                        else None)
         browser = ResourceBrowser(
-            frame, lambda: self.context_var.get().strip(), RESOURCE_GROUPS[group])
+            frame, lambda: self.context_var.get().strip(), RESOURCE_GROUPS[group],
+            on_reconcile=on_reconcile)
         browser.pack(fill="both", expand=True)
 
     def _build_crd_tab(self):
@@ -3127,7 +3521,7 @@ class Kind:
 
     def __init__(self, label, ktype, namespaced, columns, row, *,
                  scalable=False, restartable=False, deletable=True,
-                 ns_by_subject=False):
+                 ns_by_subject=False, reconcilable=False, severity=None):
         self.label = label
         self.ktype = ktype            # kubectl resource type (e.g. "deployments")
         self.namespaced = namespaced
@@ -3136,6 +3530,12 @@ class Kind:
         self.scalable = scalable
         self.restartable = restartable
         self.deletable = deletable
+        # PVCs: offer "Reconcile Multi-Attach…" to break an RWO attach standoff.
+        self.reconcilable = reconcilable
+        # Optional fn(item) -> "crit" | "warn" | "" to color a row red/amber in the
+        # browser table (used e.g. to flag VolumeAttachments carrying an attachError,
+        # the cluster-side symptom of a Multi-Attach standoff). None = never colored.
+        self.severity = severity
         # Cluster-scoped kinds (e.g. ClusterRoleBindings) that can still be filtered
         # by the namespace of their .subjects, client-side.
         self.ns_by_subject = ns_by_subject
@@ -3255,6 +3655,25 @@ def _sc_row(it):
             it.get("reclaimPolicy", ""), _row_age(it)]
 
 
+def _va_row(it):
+    sp, st = it.get("spec", {}), it.get("status", {})
+    pv = (sp.get("source") or {}).get("persistentVolumeName", "—")
+    err = st.get("attachError", {}).get("message", "")
+    return [_meta(it)["name"], pv, sp.get("nodeName", "—"),
+            str(st.get("attached", False)),
+            (err[:60] + "…") if len(err) > 60 else (err or "—"), _row_age(it)]
+
+
+def _va_severity(it):
+    """Red a VolumeAttachment row that reports an attach/detach error — the
+    controller couldn't (de)attach the volume, which is the cluster-side face of
+    a Multi-Attach standoff. Any attachError/detachError present = crit."""
+    st = it.get("status", {})
+    if st.get("attachError") or st.get("detachError"):
+        return "crit"
+    return ""
+
+
 def _sa_row(it):
     # secrets + imagePullSecrets are separate lists; automount defaults to true.
     n_secrets = len(it.get("secrets", []) or [])
@@ -3354,12 +3773,15 @@ RESOURCE_GROUPS = {
     "Storage": [
         Kind("PersistentVolumeClaims", "persistentvolumeclaims", True,
              [("name", 260), ("status", 90), ("volume", 220), ("capacity", 90),
-              ("storageclass", 130), ("age", 80)], _pvc_row),
+              ("storageclass", 130), ("age", 80)], _pvc_row, reconcilable=True),
         Kind("PersistentVolumes", "persistentvolumes", False,
              [("name", 240), ("capacity", 90), ("access", 120), ("reclaim", 90),
               ("status", 90), ("claim", 200), ("storageclass", 120), ("age", 70)], _pv_row),
         Kind("StorageClasses", "storageclasses", False,
              [("name", 260), ("provisioner", 300), ("reclaim", 110), ("age", 80)], _sc_row),
+        Kind("VolumeAttachments", "volumeattachments", False,
+             [("name", 260), ("volume (PV)", 220), ("node", 160), ("attached", 80),
+              ("error", 220), ("age", 70)], _va_row, severity=_va_severity),
     ],
 }
 
@@ -3367,9 +3789,12 @@ RESOURCE_GROUPS = {
 class ResourceBrowser(ttk.Frame):
     """A grouped resource tab: type selector + namespace filter + table + actions."""
 
-    def __init__(self, parent, get_context, kinds):
+    def __init__(self, parent, get_context, kinds, on_reconcile=None):
         super().__init__(parent)
         self._get_context = get_context
+        # Callback(ns, name, context, status_lbl, on_done) for the Reconcile
+        # Multi-Attach action (PVC kinds only); None hides the button.
+        self._on_reconcile = on_reconcile
         self._kinds = {k.label: k for k in kinds}
         self._q: queue.Queue = queue.Queue()
         self._rows = {}               # tree iid -> (Kind, name, namespace)
@@ -3411,6 +3836,11 @@ class ResourceBrowser(ttk.Frame):
         self.scale_btn.pack(side="left")
         self.restart_btn.pack(side="left", padx=4)
         self.delete_btn.pack(side="left")
+        # Only shown on kinds that declare reconcilable (PVCs) with a callback wired.
+        self.reconcile_btn = ttk.Button(act, text="Reconcile Multi-Attach…",
+                                        command=self._do_reconcile)
+        if self._on_reconcile is not None:
+            self.reconcile_btn.pack(side="left", padx=4)
         ttk.Label(act, text="  (double-click a row to open it here; click ⧉ for a new window)"
                   ).pack(side="left", padx=6)
         # Export the current view (respects the Type/Namespace filters on screen).
@@ -3470,6 +3900,9 @@ class ResourceBrowser(ttk.Frame):
         self.scale_btn.state(["!disabled"] if kind.scalable else ["disabled"])
         self.restart_btn.state(["!disabled"] if kind.restartable else ["disabled"])
         self.delete_btn.state(["!disabled"] if kind.deletable else ["disabled"])
+        if self._on_reconcile is not None:
+            self.reconcile_btn.state(
+                ["!disabled"] if kind.reconcilable else ["disabled"])
         self.status.config(text="⏳ loading…")
         ctx = self._get_context()
         ns = self.ns_var.get()
@@ -3543,11 +3976,16 @@ class ResourceBrowser(ttk.Frame):
         tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         self._tree = tree
+        # Shared red/amber row palette (matches _make_tree). Only rows a Kind's
+        # severity fn flags get tagged — e.g. VolumeAttachments with an attachError.
+        tree.tag_configure("crit", background="#5a1e1e")   # red — failing
+        tree.tag_configure("warn", background="#5a4a1e")   # amber — heads-up
 
         for it in sorted(items, key=lambda x: _meta(x).get("name", "")):
             ns = _meta(it).get("namespace", "")
             vals = ["⧉"] + ([ns] if kind.namespaced else []) + kind.row(it)
-            iid = tree.insert("", "end", values=vals)
+            sev = kind.severity(it) if kind.severity else ""
+            iid = tree.insert("", "end", tags=((sev,) if sev else ()), values=vals)
             # Store the row's OWN kind (usually ``kind``; may differ in an
             # aggregate view that merges several kinds — see _item_kind).
             self._rows[iid] = (self._item_kind(kind, it), _meta(it).get("name", ""), ns)
@@ -3653,6 +4091,22 @@ class ResourceBrowser(ttk.Frame):
         self._run_action(lambda: kubectl_collect.delete(
             kind.ktype, name, namespace=ns, context=self._get_context()),
             f"deleted {name}")
+
+    def _do_reconcile(self):
+        """Reconcile a Multi-Attach standoff for the selected PVC (delegates to
+        the app's shared analysis/dialog; reloads the table when it finishes)."""
+        if self._on_reconcile is None:
+            return
+        sel = self._selection()
+        if not sel:
+            return
+        kind, name, ns = sel
+        if not kind.reconcilable:
+            messagebox.showinfo(
+                "Not applicable", "Pick a PersistentVolumeClaim to reconcile.")
+            return
+        self._on_reconcile(ns, name, self._get_context(), self.status,
+                           lambda: self.after(300, self._reload))
 
     def _run_action(self, fn, ok_msg):
         """Run a mutating action off-thread, report via the queue, then reload."""

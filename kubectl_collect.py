@@ -334,11 +334,34 @@ def uncordon(name: str, *, context: str = "") -> str:
     return _run(["uncordon", name], context=context)
 
 
-def delete(ktype: str, name: str, *, namespace: str = "", context: str = "") -> str:
+def delete(ktype: str, name: str, *, namespace: str = "", context: str = "",
+           force: bool = False, grace_period: int | None = None) -> str:
+    """`kubectl delete <ktype> <name>`.
+
+    force=True adds `--force --grace-period=0` — needed to evict a pod stuck
+    Terminating on an unreachable node so its RWO volume can detach (this is how
+    a Multi-Attach standoff gets broken). Only force-delete when you know the old
+    node is truly gone; force-deleting a pod whose volume is still mounted risks
+    data corruption.
+    """
     args = ["delete", ktype, name]
     if namespace:
         args += ["-n", namespace]
+    if force:
+        args += ["--force", "--grace-period=0"]
+    elif grace_period is not None:
+        args.append(f"--grace-period={grace_period}")
     return _run(args, context=context)
+
+
+def get_item(ktype: str, name: str, *, namespace: str = "",
+             context: str = "", timeout: int = 30) -> dict:
+    """`kubectl get <ktype> <name> -o json` -> the single object dict."""
+    args = ["get", ktype, name]
+    if namespace:
+        args += ["-n", namespace]
+    args += ["-o", "json"]
+    return json.loads(_run(args, context=context, timeout=timeout))
 
 
 def list_contexts() -> tuple[list[str], str]:
