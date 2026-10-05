@@ -201,6 +201,13 @@ troubleshooting without leaving the app:
   context is selected (or hit **⟳ Refresh**). Click a target to auto-build a
   connectivity command, then **▶ Run in pod** to execute it inside the connected
   debug pod — testing connectivity while keeping the whole target list in view.
+- **Port-forward to localhost** — select a **Service** and **⇅ Port-forward
+  selected** to reach it from *this machine*: you're prompted for a local port
+  (defaulting to the service's), and `kubectl port-forward svc/<name>
+  <local>:<remote>` runs in the background with its output streamed to the
+  Terminal. The bar shows active forwards; **■ Stop forwards** tears them all
+  down. (Port-forward targets Services/pods; VirtualServers/TransportServers are
+  ingress hosts — curl those instead.)
 - **Pick the call** — a **Tool** dropdown chooses how the command is formed:
   `curl`, `wget` (for images without curl), `nc` (port reachability), `ping`, or
   `nslookup` (DNS). Services build an HTTP call on their port; ingress hosts

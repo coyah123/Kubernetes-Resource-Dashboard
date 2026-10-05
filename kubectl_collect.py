@@ -281,6 +281,31 @@ def popen_exec(namespace: str, pod: str, shell: str = "sh", *,
     return proc
 
 
+def popen_port_forward(resource: str, name: str, local_port: str, remote_port: str,
+                       *, namespace: str = "", context: str = "") -> subprocess.Popen:
+    """
+    Start `kubectl port-forward <resource>/<name> <local>:<remote>` and return the
+    running Popen so a local client can reach an in-cluster Service/Pod.
+
+    stdout+stderr are merged and line-buffered so a reader thread can surface the
+    "Forwarding from 127.0.0.1:<local> -> <remote>" line. The caller owns the
+    process and must terminate() it when done.
+    """
+    cmd = _base_cmd()
+    if context:
+        cmd += ["--context", context]
+    cmd += ["port-forward", f"{resource}/{name}", f"{local_port}:{remote_port}"]
+    if namespace:
+        cmd += ["-n", namespace]
+    _record(cmd)
+    if shutil.which(cmd[0]) is None:
+        raise KubectlError(f"'{cmd[0]}' was not found on your PATH.")
+    return subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, creationflags=_NO_WINDOW,
+    )
+
+
 def list_items(ktype: str, *, namespace: str = "", all_namespaces: bool = False,
                context: str = "", timeout: int = 30) -> list[dict]:
     """`kubectl get <ktype> [-A|-n ns] -o json` -> the .items list."""

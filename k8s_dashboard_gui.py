@@ -1008,6 +1008,7 @@ class Dashboard(tk.Tk):
         # Debugging tab state (saved image tags + the embedded exec session).
         self._dbg_images_path = folder / "debug_images.json"
         self._dbg_procs: list = []        # exec Popens we own (killed on reconnect)
+        self._dbg_pf_procs: list = []     # (Popen, label) for active port-forwards
         self._dbg_exec = {"proc": None, "q": queue.Queue(), "out": None,
                           "status": None, "ns": "", "pod": ""}
         self._dbg_targets_q: queue.Queue = queue.Queue()
@@ -3038,6 +3039,17 @@ class Dashboard(tk.Tk):
         curlbar.add(ttk.Button(curlbar, text="Copy", command=lambda: (
             self.clipboard_clear(), self.clipboard_append(self._dbg_curl.get()))), padx=4)
 
+        # Port-forward a selected Service to localhost (reach it from this machine).
+        pfbar = WrapBar(right, padding=(0, 2, 0, 0))
+        pfbar.pack(fill="x")
+        pfbar.add(ttk.Button(pfbar, text="⇅ Port-forward selected",
+                             command=self._dbg_port_forward))
+        pfbar.add(ttk.Button(pfbar, text="■ Stop forwards",
+                             command=self._dbg_stop_forwards), padx=4)
+        self._dbg_pf_status = ttk.Label(pfbar, text="no active forwards",
+                                        foreground="#777")
+        pfbar.add(self._dbg_pf_status, padx=4)
+
         self._dbg_reload_images()
         self._dbg_exec_pump()
         # Fill the namespace dropdown + network targets lazily so building the tab
@@ -3236,6 +3248,8 @@ class Dashboard(tk.Tk):
                 self._dbg_handle_result(kind, key, payload)
         except queue.Empty:
             pass
+        if self._dbg_pf_procs:           # keep the active-forwards label accurate
+            self._dbg_update_pf_status()
         self.after(150, self._dbg_exec_pump)
 
     def _dbg_handle_result(self, kind, key, payload):
@@ -3329,6 +3343,80 @@ class Dashboard(tk.Tk):
         if not cmd:
             return
         self._dbg_exec_send(cmd)
+
+    # -- Debugging: port-forward a Service to localhost --------------------
+    def _dbg_port_forward(self):
+        """
+        Start `kubectl port-forward` for the selected Service so it's reachable
+        from this machine. Port-forward targets Services/Pods — VirtualServers and
+        TransportServers are ingress hosts (curl them instead), so they're rejected
+        with a hint. The forward's output streams into the Terminal pane.
+        """
+        sel = self._dbg_targets_tree.selection()
+        vals = self._dbg_targets_tree.item(sel[0], "values") if sel else ()
+        if not vals:
+            messagebox.showinfo("Port-forward", "Select a Service in the list first.")
+            return
+        kind, name, host, ports = vals
+        if kind != "Service":
+            messagebox.showinfo(
+                "Port-forward",
+                f"Port-forward targets a Service (or pod). “{kind}” is an ingress "
+                "host — use a curl/wget call against its host instead.")
+            return
+        # Service host is name.namespace.svc.cluster.local → parts[1] is the ns.
+        parts = host.split(".")
+        ns = parts[1] if len(parts) > 1 else ""
+        remote = ports.split(",")[0].strip() if ports else ""
+        if not remote:
+            messagebox.showinfo("Port-forward", f"{name} exposes no ports.")
+            return
+        local = simpledialog.askstring(
+            "Port-forward", f"Local port for {name} (remote {remote}):",
+            initialvalue=remote, parent=self)
+        if not local:
+            return
+        local = local.strip()
+        ctx = self.context_var.get().strip()
+        try:
+            proc = kubectl_collect.popen_port_forward(
+                "svc", name, local, remote, namespace=ns, context=ctx)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Port-forward failed", str(e))
+            return
+        label = f"{name} {local}→{remote}"
+        self._dbg_pf_procs.append((proc, label))
+        self._dbg_exec["out"].insert("end", f"\n[port-forward] started {label}\n")
+        self._dbg_exec["out"].see("end")
+
+        def reader(p, lbl):
+            try:
+                for line in p.stdout:
+                    self._dbg_exec["q"].put(f"[pf {lbl}] {line}")
+            except Exception:  # noqa: BLE001
+                pass
+            self._dbg_exec["q"].put(f"[pf {lbl}] ended\n")
+
+        threading.Thread(target=reader, args=(proc, label), daemon=True).start()
+        self._dbg_update_pf_status()
+
+    def _dbg_stop_forwards(self):
+        """Terminate every active port-forward."""
+        for proc, _label in self._dbg_pf_procs:
+            self._dbg_terminate(proc)
+        self._dbg_pf_procs = []
+        self._dbg_update_pf_status()
+
+    def _dbg_update_pf_status(self):
+        """Refresh the 'N active forwards' label, dropping any that have exited."""
+        self._dbg_pf_procs = [(p, l) for (p, l) in self._dbg_pf_procs
+                              if p.poll() is None]
+        if not self._dbg_pf_procs:
+            self._dbg_pf_status.config(text="no active forwards")
+        else:
+            labels = ", ".join(l for _p, l in self._dbg_pf_procs)
+            self._dbg_pf_status.config(
+                text=f"{len(self._dbg_pf_procs)} active: {labels}")
 
     def _dbg_terminate(self, proc):
         """Best-effort terminate of an exec Popen we own."""
