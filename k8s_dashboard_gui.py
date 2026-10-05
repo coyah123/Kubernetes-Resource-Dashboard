@@ -928,6 +928,29 @@ def debug_network_targets(context: str = "") -> list:
     return rows
 
 
+# Connectivity tools the Debugging tab can run against a selected target. Each
+# returns the command string for (host, port, secure) — `secure` picks HTTPS/TLS
+# for ingress hosts (VirtualServer/TransportServer) vs plain HTTP for Services.
+DEBUG_CALL_TOOLS = ("curl", "wget", "nc", "ping", "nslookup")
+
+
+def build_debug_call(tool: str, host: str, port: str, secure: bool) -> str:
+    """Form a connectivity command for `host[:port]` using the chosen tool."""
+    port = (port or ("443" if secure else "80")).strip()
+    if tool == "wget":
+        return (f"wget -qO- --no-check-certificate https://{host}/" if secure
+                else f"wget -qO- http://{host}:{port}/")
+    if tool == "nc":
+        return f"nc -zv {host} {port}"
+    if tool == "ping":
+        return f"ping -c 3 {host}"
+    if tool == "nslookup":
+        return f"nslookup {host}"
+    # default: curl
+    return (f"curl -s -k https://{host}/" if secure
+            else f"curl -s http://{host}:{port}/")
+
+
 # ---------------------------------------------------------------------------
 # GUI — main window (Dashboard): control rows, sidebar nav, and the analysis
 # tabs (Overview / Nodes / Deployments / Pods / Resource Management / Trends).
@@ -2974,8 +2997,15 @@ class Dashboard(tk.Tk):
 
         curlbar = WrapBar(right, padding=(0, 2, 0, 0))
         curlbar.pack(fill="x")
+        curlbar.add(ttk.Label(curlbar, text="Tool:"))
+        self._dbg_tool = tk.StringVar(value="curl")
+        tool_box = ttk.Combobox(curlbar, textvariable=self._dbg_tool, width=9,
+                                state="readonly", values=list(DEBUG_CALL_TOOLS))
+        curlbar.add(tool_box, padx=4)
+        # Re-form the command for the current target when the tool changes.
+        tool_box.bind("<<ComboboxSelected>>", lambda e: self._dbg_target_to_curl())
         self._dbg_curl = tk.StringVar(value="curl -s http://")
-        curlbar.add(ttk.Entry(curlbar, textvariable=self._dbg_curl, width=40), padx=(0, 4))
+        curlbar.add(ttk.Entry(curlbar, textvariable=self._dbg_curl, width=36), padx=4)
         curlbar.add(ttk.Button(curlbar, text="▶ Run in pod", command=self._dbg_run_curl))
         curlbar.add(ttk.Button(curlbar, text="Copy", command=lambda: (
             self.clipboard_clear(), self.clipboard_append(self._dbg_curl.get()))), padx=4)
@@ -3231,16 +3261,15 @@ class Dashboard(tk.Tk):
         self.status.config(text=f"✓ {len(rows)} network target(s)")
 
     def _dbg_target_to_curl(self):
-        """Build a curl command for the selected target into the curl entry."""
+        """Build the connectivity command for the selected target + chosen tool."""
         sel = self._dbg_targets_tree.selection()
         if not sel:
             return
         kind, ns, name, host, ports = self._dbg_targets_tree.item(sel[0], "values")
-        if kind == "Service":
-            port = (ports.split(",")[0] if ports else "80").strip() or "80"
-            self._dbg_curl.set(f"curl -s http://{host}:{port}/")
-        else:  # VirtualServer / TransportServer — hit the host over TLS
-            self._dbg_curl.set(f"curl -s -k https://{host}/")
+        # Services are plain HTTP on their port; ingress hosts (VS/TS) are TLS.
+        secure = kind != "Service"
+        port = (ports.split(",")[0].strip() if ports else "")
+        self._dbg_curl.set(build_debug_call(self._dbg_tool.get(), host, port, secure))
 
     def _dbg_run_curl(self):
         """Send the curl command into the connected debug pod's shell."""

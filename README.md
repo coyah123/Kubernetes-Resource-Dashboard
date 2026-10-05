@@ -194,9 +194,14 @@ troubleshooting without leaving the app:
 - **Network targets (right panel)** — every **Service** (with its
   `name.namespace.svc.cluster.local` hostname) plus any NGINX **VirtualServers**
   and **TransportServers** (with `spec.host`), so you can see hostnames at a
-  glance. Click a target to auto-build a `curl` command, then **▶ Run in pod** to
-  execute it inside the connected debug pod — testing connectivity while keeping
-  the whole target list in view.
+  glance. Click a target to auto-build a connectivity command, then **▶ Run in
+  pod** to execute it inside the connected debug pod — testing connectivity while
+  keeping the whole target list in view.
+- **Pick the call** — a **Tool** dropdown chooses how the command is formed:
+  `curl`, `wget` (for images without curl), `nc` (port reachability), `ping`, or
+  `nslookup` (DNS). Services build an HTTP call on their port; ingress hosts
+  (VirtualServer/TransportServer) build a TLS call on the `spec.host`. The command
+  field is editable, so you can tweak it before running.
 
 **Secrets** get an extra **Get secret** tab: each `data` key is listed with its
 value **hidden by default** behind a **Reveal values** toggle, a **Decoder**
