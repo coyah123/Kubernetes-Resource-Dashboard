@@ -874,30 +874,62 @@ def parse_env_assignments(text: str) -> dict:
 # private registry path never lands in git. Kept as free functions for testing.
 # ---------------------------------------------------------------------------
 def load_debug_images(path) -> list:
-    """Return the saved image tags (most-recent first); [] if the file is missing."""
+    """
+    Return the saved debug images (most-recent first) as
+    {"name", "description", "tag"} dicts; [] if the file is missing.
+
+    Older files stored bare tag strings — those are upgraded in place to records
+    whose name defaults to the tag, so existing lists keep working.
+    """
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    return [str(x) for x in data] if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if isinstance(item, str) and item:
+            out.append({"name": item, "description": "", "tag": item})
+        elif isinstance(item, dict) and item.get("tag"):
+            tag = str(item["tag"])
+            out.append({"name": str(item.get("name") or tag),
+                        "description": str(item.get("description") or ""),
+                        "tag": tag})
+    return out
 
 
 def save_debug_images(path, images) -> None:
-    """Write `images` (de-duplicated, order preserved) to the JSON file."""
+    """Write `images` to the JSON file, de-duplicated by tag (order preserved)."""
+    seen, uniq = set(), []
+    for im in images:
+        tag = (im.get("tag") or "").strip()
+        if tag and tag not in seen:
+            seen.add(tag)
+            uniq.append({"name": (im.get("name") or tag).strip(),
+                         "description": (im.get("description") or "").strip(),
+                         "tag": tag})
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(list(dict.fromkeys(images)), indent=2), encoding="utf-8")
+    p.write_text(json.dumps(uniq, indent=2), encoding="utf-8")
 
 
-def add_debug_image(path, tag: str) -> list:
-    """Add `tag` to the front of the saved list (moving an existing one up)."""
-    tag = tag.strip()
+def add_debug_image(path, name: str, description: str, tag: str) -> list:
+    """Add/replace an image record (keyed by tag) at the front of the saved list."""
+    tag = (tag or "").strip()
     images = load_debug_images(path)
     if not tag:
         return images
-    if tag in images:
-        images.remove(tag)
-    images.insert(0, tag)
+    images = [im for im in images if im["tag"] != tag]
+    images.insert(0, {"name": (name or tag).strip(),
+                      "description": (description or "").strip(), "tag": tag})
+    save_debug_images(path, images)
+    return images
+
+
+def delete_debug_image(path, tag: str) -> list:
+    """Remove the image record with `tag` from the saved list."""
+    images = [im for im in load_debug_images(path) if im["tag"] != tag]
     save_debug_images(path, images)
     return images
 
@@ -2915,13 +2947,23 @@ class Dashboard(tk.Tk):
         deploy = ttk.Labelframe(left, text="Deploy debug pod", padding=6)
         deploy.pack(fill="x")
 
+        # Save a new image record: name, description, and the image tag.
         imgbar = WrapBar(deploy)
         imgbar.pack(fill="x")
-        imgbar.add(ttk.Label(imgbar, text="New image tag:"))
+        imgbar.add(ttk.Label(imgbar, text="Name:"))
+        self._dbg_new_name = tk.StringVar()
+        imgbar.add(ttk.Entry(imgbar, textvariable=self._dbg_new_name, width=16), padx=4)
+        imgbar.add(ttk.Label(imgbar, text="Description:"), padx=(8, 0))
+        self._dbg_new_desc = tk.StringVar()
+        imgbar.add(ttk.Entry(imgbar, textvariable=self._dbg_new_desc, width=28), padx=4)
+
+        imgbar2 = WrapBar(deploy, padding=(0, 4, 0, 0))
+        imgbar2.pack(fill="x")
+        imgbar2.add(ttk.Label(imgbar2, text="Image tag:"))
         self._dbg_new_img = tk.StringVar()
-        imgbar.add(ttk.Entry(imgbar, textvariable=self._dbg_new_img, width=40), padx=4)
-        imgbar.add(ttk.Button(imgbar, text="＋ Save to list",
-                              command=self._dbg_save_image))
+        imgbar2.add(ttk.Entry(imgbar2, textvariable=self._dbg_new_img, width=40), padx=4)
+        imgbar2.add(ttk.Button(imgbar2, text="＋ Save to list",
+                               command=self._dbg_save_image))
 
         depbar = WrapBar(deploy, padding=(0, 4, 0, 0))
         depbar.pack(fill="x")
@@ -2930,6 +2972,9 @@ class Dashboard(tk.Tk):
         self._dbg_image_box = ttk.Combobox(depbar, textvariable=self._dbg_image,
                                            width=34, state="readonly")
         depbar.add(self._dbg_image_box, padx=4)
+        self._dbg_image_box.bind("<<ComboboxSelected>>",
+                                 lambda e: self._dbg_show_image_desc())
+        depbar.add(ttk.Button(depbar, text="🗑 Delete", command=self._dbg_delete_image))
         depbar.add(ttk.Label(depbar, text="Pod name:"), padx=(8, 0))
         self._dbg_pod_name = tk.StringVar(value=self._dbg_default_pod_name())
         depbar.add(ttk.Entry(depbar, textvariable=self._dbg_pod_name, width=20), padx=4)
@@ -2940,6 +2985,10 @@ class Dashboard(tk.Tk):
         depbar.add(self._dbg_ns_box, padx=4)
         depbar.add(ttk.Button(depbar, text="🚀 Deploy",
                               command=self._dbg_deploy))
+
+        self._dbg_image_desc = ttk.Label(deploy, text="", foreground="#777",
+                                         wraplength=560, justify="left")
+        self._dbg_image_desc.pack(anchor="w", pady=(4, 0))
 
         # 2) Debug pods: list (with phase, so you can see what's Running) + actions.
         pods = ttk.Labelframe(left, text="Debug pods", padding=6)
@@ -3063,24 +3112,62 @@ class Dashboard(tk.Tk):
         """A unique-ish default debug pod name (debug-HHMMSS)."""
         return "debug-" + time.strftime("%H%M%S")
 
-    def _dbg_reload_images(self):
-        """Refresh the image dropdown from the saved (gitignored) tags file."""
-        images = load_debug_images(self._dbg_images_path)
-        self._dbg_image_box["values"] = images
-        if images and self._dbg_image.get() not in images:
-            self._dbg_image.set(images[0])
+    def _dbg_reload_images(self, select_tag: str = ""):
+        """Refresh the image dropdown from the saved (gitignored) records file.
+
+        Each record shows as "name  (tag)"; `self._dbg_image_tags` maps that label
+        back to its tag so deploy/delete can resolve the real image.
+        """
+        records = load_debug_images(self._dbg_images_path)
+        self._dbg_image_records = records
+        self._dbg_image_tags = {f"{r['name']}  ({r['tag']})": r["tag"] for r in records}
+        labels = list(self._dbg_image_tags)
+        self._dbg_image_box["values"] = labels
+        want = select_tag or self._dbg_current_tag()
+        label = next((lb for lb, tg in self._dbg_image_tags.items() if tg == want), "")
+        self._dbg_image.set(label or (labels[0] if labels else ""))
+        self._dbg_show_image_desc()
+
+    def _dbg_current_tag(self) -> str:
+        """The image tag for the dropdown's current selection (label → tag)."""
+        return getattr(self, "_dbg_image_tags", {}).get(self._dbg_image.get(), "")
+
+    def _dbg_show_image_desc(self):
+        """Show the selected image's description + full tag under the controls."""
+        tag = self._dbg_current_tag()
+        rec = next((r for r in getattr(self, "_dbg_image_records", [])
+                    if r["tag"] == tag), None)
+        if not rec:
+            self._dbg_image_desc.config(text="")
+            return
+        desc = rec["description"] or "(no description)"
+        self._dbg_image_desc.config(text=f"{desc}\n{rec['tag']}")
 
     def _dbg_save_image(self):
-        """Save the pasted tag to the gitignored list and select it."""
+        """Save the entered name/description/tag to the gitignored list, select it."""
         tag = self._dbg_new_img.get().strip()
         if not tag:
-            messagebox.showinfo("No tag", "Paste an image tag first.")
+            messagebox.showinfo("No tag", "Enter an image tag first.")
             return
-        add_debug_image(self._dbg_images_path, tag)
+        add_debug_image(self._dbg_images_path, self._dbg_new_name.get(),
+                        self._dbg_new_desc.get(), tag)
+        self._dbg_new_name.set("")
+        self._dbg_new_desc.set("")
         self._dbg_new_img.set("")
-        self._dbg_reload_images()
-        self._dbg_image.set(tag)
+        self._dbg_reload_images(select_tag=tag)
         self.status.config(text=f"✓ saved debug image: {tag}")
+
+    def _dbg_delete_image(self):
+        """Delete the currently-selected image record from the saved list."""
+        tag = self._dbg_current_tag()
+        if not tag:
+            messagebox.showinfo("No image", "Pick a saved image to delete.")
+            return
+        if not messagebox.askyesno("Delete image", f"Remove this image from the list?\n\n{tag}"):
+            return
+        delete_debug_image(self._dbg_images_path, tag)
+        self._dbg_reload_images()
+        self.status.config(text=f"✓ removed debug image: {tag}")
 
     def _dbg_refresh_namespaces(self):
         """Populate the Debugging namespace dropdown for the current context (off-thread)."""
@@ -3098,7 +3185,7 @@ class Dashboard(tk.Tk):
     # -- Debugging: deploy / list / delete pods ----------------------------
     def _dbg_deploy(self):
         """kubectl run a debug pod from the selected image, off the UI thread."""
-        image = self._dbg_image.get().strip()
+        image = self._dbg_current_tag()
         name = self._dbg_pod_name.get().strip()
         ns = self._dbg_ns.get().strip()
         if not image:

@@ -181,10 +181,12 @@ exports here afterward.)
 A dedicated **Debugging** tab (next to **Trends**) for in-cluster network
 troubleshooting without leaving the app:
 
-- **Saved debug images** — paste an image tag (e.g. an ACR path) and **＋ Save to
-  list**; tags persist to `debug_images.json` in the data folder, which is
-  **gitignored** so a private registry path never lands in git. Deploy from the
-  **Image** dropdown of saved tags.
+- **Saved debug images** — give each image a **Name**, **Description**, and
+  **Image tag** (e.g. an ACR path) and **＋ Save to list**; records persist to
+  `debug_images.json` in the data folder, which is **gitignored** so a private
+  registry path never lands in git. The **Image** dropdown lists them as
+  `name (tag)` with the description shown below; **🗑 Delete** removes the selected
+  one. (Older files that stored bare tags are upgraded automatically.)
 - **Deploy a debug pod** — pick an image, name the pod, choose a namespace, and
   **🚀 Deploy** (`kubectl run … --command -- sh -c 'sleep infinity'` so it stays
   Running). List/refresh pods and **🗑 Delete** them from the same panel.
