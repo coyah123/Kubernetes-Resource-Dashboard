@@ -286,7 +286,7 @@ line binaries**, not Python libraries — see Prerequisites.)
 | `tkinter` (`tk`, `ttk`, `filedialog`, `messagebox`, `simpledialog`) | ✅ | The entire GUI — windows, notebook tabs, tables, dialogs, themed widgets |
 | `subprocess` | ✅ | Running the external `kubectl` and `openssl` binaries and capturing their output |
 | `shutil` | ✅ | `shutil.which()` — locating `kubectl` / `openssl` on the user's PATH |
-| `shlex` | ✅ | Splitting a `KUBECTL` override (e.g. `"sudo k3s kubectl"`) into args, respecting quotes |
+| `shlex` | ✅ | Splitting a `KUBECTL` override (e.g. `"sudo k3s kubectl"`) into args, respecting quotes; and `shlex.quote()` to safely quote the argv when launching `kubectl edit` in an external terminal on macOS/Linux (must be imported in **both** `kubectl_collect.py` and `k8s_dashboard_gui.py` — the GUI's macOS/Linux terminal-launch path calls it, so a missing import there surfaces as a `NameError` only on those platforms) |
 | `os` | ✅ | Reading env vars (`KUBECTL`, `KUBECONFIG`, and `KUBE_EDITOR`/`EDITOR` for live edit) |
 | `sys` | ✅ | Platform detection (`win32` → hide the console window) and `argv` |
 | `threading` | ✅ | Running kubectl/openssl on background threads so the UI never blocks |

@@ -65,6 +65,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -2765,9 +2766,16 @@ class ResourceDetailView(ttk.Frame):
         if on_back is not None:
             ttk.Button(header, text="← Back", command=on_back).pack(side="left")
         ttk.Label(header, text=f"  {crumb}", font=("", 10, "bold")).pack(side="left")
-        # Live edit: hand off to `kubectl edit` in a real terminal (see _launch_edit).
-        ttk.Button(header, text="✎ Edit (kubectl edit)",
-                   command=self._launch_edit).pack(side="right")
+        # Edit: let the user choose an in-app YAML editor (apply -f -) or hand off
+        # to `kubectl edit` in a real terminal (see _edit_in_app / _launch_edit).
+        edit_mb = ttk.Menubutton(header, text="✎ Edit ▾")
+        edit_menu = tk.Menu(edit_mb, tearoff=False)
+        edit_menu.add_command(label="Edit in app (built-in YAML editor)",
+                              command=self._edit_in_app)
+        edit_menu.add_command(label="Edit in external terminal (kubectl edit)",
+                              command=self._launch_edit)
+        edit_mb["menu"] = edit_menu
+        edit_mb.pack(side="right")
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -2792,6 +2800,90 @@ class ResourceDetailView(ttk.Frame):
             self._after_ids.append(self.after(120, self._poll_secret))
         # If the frame is destroyed out from under us (e.g. tab rebuild), clean up.
         self.bind("<Destroy>", lambda e: self.teardown() if e.widget is self else None)
+
+    # -- in-app edit (fetch YAML, edit, `kubectl apply -f -`) ---------------
+    def _edit_in_app(self):
+        """
+        Open a built-in editor: fetch the resource's YAML, let the user edit it
+        in a Text widget, and apply it with `kubectl apply -f -` on save. No
+        external terminal or $EDITOR required — the whole flow stays in the app.
+        """
+        if kubectl_collect.kubectl_path() is None:
+            messagebox.showerror("kubectl not found",
+                                 "kubectl must be on your PATH (or set KUBECTL) to edit.")
+            return
+
+        nsargs = ["-n", self.namespace] if self.namespace else []
+        try:
+            yaml_text = kubectl_collect.run_text(
+                ["get", self.kind, self.name] + nsargs + ["-o", "yaml"],
+                context=self.context)
+        except Exception as e:  # noqa: BLE001 — surfaced to the user
+            messagebox.showerror("Could not load YAML", str(e))
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Edit {self.kind}/{self.name}"
+                  + (f" -n {self.namespace}" if self.namespace else ""))
+        win.geometry("820x640")
+        win.transient(self.winfo_toplevel())
+
+        bar = ttk.Frame(win, padding=4)
+        bar.pack(fill="x")
+        status = ttk.Label(bar, text="Edit the YAML, then Apply. Apply runs "
+                                     "`kubectl apply -f -`.")
+        status.pack(side="left", padx=4)
+
+        wrap = ttk.Frame(win)
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, wrap="none", font=("Consolas", 10), undo=True,
+                      background="#111", foreground="#ddd", insertbackground="#ddd")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        hs = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        hs.pack(fill="x")
+        txt.insert("1.0", yaml_text)
+
+        btns = ttk.Frame(win, padding=4)
+        btns.pack(fill="x")
+
+        # Dedicated queue so the apply result doesn't collide with _poll_cmd's.
+        apply_q: queue.Queue = queue.Queue()
+
+        def do_apply():
+            edited = txt.get("1.0", "end-1c")
+            status.config(text="⏳ applying…")
+            apply_btn.config(state="disabled")
+
+            def work():
+                try:
+                    out = kubectl_collect.apply_yaml(edited, context=self.context)
+                    apply_q.put((out, None))
+                except Exception as e:  # noqa: BLE001 — surfaced in the dialog
+                    apply_q.put(("", e))
+
+            def poll():
+                try:
+                    out, err = apply_q.get_nowait()
+                except queue.Empty:
+                    win.after(100, poll)
+                    return
+                if err is not None:
+                    status.config(text="⚠ apply failed")
+                    apply_btn.config(state="normal")
+                    messagebox.showerror("Apply failed", str(err), parent=win)
+                else:
+                    messagebox.showinfo("Applied", out.strip() or "Applied.", parent=win)
+                    win.destroy()
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(100, poll)
+
+        apply_btn = ttk.Button(btns, text="✔ Apply", command=do_apply)
+        apply_btn.pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=6)
 
     # -- live edit (hand off to `kubectl edit`) ----------------------------
     def _launch_edit(self):

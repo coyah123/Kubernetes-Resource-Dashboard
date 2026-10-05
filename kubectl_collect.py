@@ -142,6 +142,44 @@ def run_text(args: list[str], *, context: str = "", timeout: int = 60) -> str:
     return _run(args, context=context, timeout=timeout)
 
 
+def apply_yaml(yaml_text: str, *, context: str = "", timeout: int = 60) -> str:
+    """
+    Pipe `yaml_text` to `kubectl apply -f -` and return its stdout.
+
+    This is the headless counterpart to `kubectl edit`: the GUI can let the user
+    edit a resource's YAML in-app and then apply it, with server-side validation,
+    without ever spawning an external terminal. Raises KubectlError on failure.
+    """
+    cmd = _base_cmd()
+    if context:
+        cmd += ["--context", context]
+    cmd += ["apply", "-f", "-"]
+    _record(cmd)
+
+    if shutil.which(cmd[0]) is None:
+        raise KubectlError(
+            f"'{cmd[0]}' was not found on your PATH.\n\n"
+            "Install kubectl and make sure it's on PATH, or set the KUBECTL "
+            "environment variable to the full command (e.g. 'sudo k3s kubectl')."
+        )
+    try:
+        proc = subprocess.run(
+            cmd, input=yaml_text, capture_output=True, text=True, timeout=timeout,
+            creationflags=_NO_WINDOW,
+        )
+    except FileNotFoundError as e:
+        raise KubectlError(f"Could not execute {cmd[0]}: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        raise KubectlError(f"kubectl apply timed out after {timeout}s") from e
+
+    if proc.returncode != 0:
+        raise KubectlError(
+            f"kubectl apply failed (exit {proc.returncode}):\n"
+            + (proc.stderr.strip() or "(no error output)")
+        )
+    return proc.stdout
+
+
 def list_namespaces(context: str = "") -> list[str]:
     """Every namespace name in the cluster (sorted). [] if the call fails."""
     try:
