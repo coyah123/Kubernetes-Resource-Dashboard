@@ -933,6 +933,9 @@ def debug_network_targets(context: str = "") -> list:
 # for ingress hosts (VirtualServer/TransportServer) vs plain HTTP for Services.
 DEBUG_CALL_TOOLS = ("curl", "wget", "nc", "ping", "nslookup")
 
+# Sentinel for "show every namespace" in the Debugging network-targets filter.
+_ALL_NS_FILTER = "(all namespaces)"
+
 
 def build_debug_call(tool: str, host: str, port: str, secure: bool) -> str:
     """Form a connectivity command for `host[:port]` using the chosen tool."""
@@ -2906,8 +2909,12 @@ class Dashboard(tk.Tk):
         panes.add(left, weight=3)
         panes.add(right, weight=2)
 
-        # --- left: image list, deploy controls, pod list, exec terminal ---
-        imgbar = WrapBar(left, padding=(0, 0, 0, 4))
+        # --- left: Deploy ▸ Debug pods ▸ Terminal (sectioned top-to-bottom) ---
+        # 1) Deploy: save image tags + run a debug pod from a saved tag.
+        deploy = ttk.Labelframe(left, text="Deploy debug pod", padding=6)
+        deploy.pack(fill="x")
+
+        imgbar = WrapBar(deploy)
         imgbar.pack(fill="x")
         imgbar.add(ttk.Label(imgbar, text="New image tag:"))
         self._dbg_new_img = tk.StringVar()
@@ -2915,41 +2922,59 @@ class Dashboard(tk.Tk):
         imgbar.add(ttk.Button(imgbar, text="＋ Save to list",
                               command=self._dbg_save_image))
 
-        depbar = WrapBar(left, padding=(0, 0, 0, 4))
+        depbar = WrapBar(deploy, padding=(0, 4, 0, 0))
         depbar.pack(fill="x")
         depbar.add(ttk.Label(depbar, text="Image:"))
         self._dbg_image = tk.StringVar()
         self._dbg_image_box = ttk.Combobox(depbar, textvariable=self._dbg_image,
-                                           width=38, state="readonly")
+                                           width=34, state="readonly")
         depbar.add(self._dbg_image_box, padx=4)
         depbar.add(ttk.Label(depbar, text="Pod name:"), padx=(8, 0))
         self._dbg_pod_name = tk.StringVar(value=self._dbg_default_pod_name())
-        depbar.add(ttk.Entry(depbar, textvariable=self._dbg_pod_name, width=22), padx=4)
+        depbar.add(ttk.Entry(depbar, textvariable=self._dbg_pod_name, width=20), padx=4)
         depbar.add(ttk.Label(depbar, text="Namespace:"), padx=(8, 0))
         self._dbg_ns = tk.StringVar(value="default")
-        self._dbg_ns_box = ttk.Combobox(depbar, textvariable=self._dbg_ns, width=20,
+        self._dbg_ns_box = ttk.Combobox(depbar, textvariable=self._dbg_ns, width=18,
                                         values=["default"])
         depbar.add(self._dbg_ns_box, padx=4)
-        depbar.add(ttk.Button(depbar, text="🚀 Deploy debug pod",
+        depbar.add(ttk.Button(depbar, text="🚀 Deploy",
                               command=self._dbg_deploy))
 
-        podbar = WrapBar(left, padding=(0, 0, 0, 2))
+        # 2) Debug pods: list (with phase, so you can see what's Running) + actions.
+        pods = ttk.Labelframe(left, text="Debug pods", padding=6)
+        pods.pack(fill="x", pady=(6, 0))
+        podbar = WrapBar(pods)
         podbar.pack(fill="x")
-        podbar.add(ttk.Label(podbar, text="Debug pods:"))
         podbar.add(ttk.Button(podbar, text="⟳ Refresh", command=self._dbg_refresh_pods))
         podbar.add(ttk.Button(podbar, text="⇆ Exec into selected",
                               command=self._dbg_exec_selected), padx=4)
         podbar.add(ttk.Button(podbar, text="🗑 Delete selected",
                               command=self._dbg_delete_selected))
-        self._dbg_pods_list = tk.Listbox(left, height=4,
+        self._dbg_pods_list = tk.Listbox(pods, height=4,
                                          background="#0b0b0b", foreground="#e0e0e0")
-        self._dbg_pods_list.pack(fill="x", pady=(0, 4))
+        self._dbg_pods_list.pack(fill="x", pady=(4, 0))
 
-        self._dbg_exec["status"] = ttk.Label(left, text="(not connected)", foreground="#777")
+        # 3) Terminal: connection/running status on top, output in the middle,
+        #    command entry pinned to the bottom.
+        term = ttk.Labelframe(left, text="Terminal", padding=6)
+        term.pack(fill="both", expand=True, pady=(6, 0))
+
+        self._dbg_exec["status"] = ttk.Label(term, text="● not connected",
+                                             foreground="#777")
         self._dbg_exec["status"].pack(anchor="w")
 
-        owrap = ttk.Frame(left)
-        owrap.pack(fill="both", expand=True)
+        # Pack the command bar (bottom) BEFORE the output so it always stays
+        # pinned to the bottom edge even as the output area grows.
+        inbar = WrapBar(term, padding=(0, 4, 0, 0))
+        inbar.pack(side="bottom", fill="x")
+        inbar.add(ttk.Label(inbar, text="$"))
+        self._dbg_cmd_entry = ttk.Entry(inbar, width=40)
+        inbar.add(self._dbg_cmd_entry, padx=4)
+        self._dbg_cmd_entry.bind("<Return>", lambda e: self._dbg_exec_send())
+        inbar.add(ttk.Button(inbar, text="Send", command=self._dbg_exec_send))
+
+        owrap = ttk.Frame(term)
+        owrap.pack(side="top", fill="both", expand=True, pady=(4, 0))
         out = tk.Text(owrap, wrap="char", font=("Consolas", 9),
                       background="#0b0b0b", foreground="#e0e0e0", insertbackground="#e0e0e0")
         ovs = ttk.Scrollbar(owrap, orient="vertical", command=out.yview)
@@ -2959,33 +2984,35 @@ class Dashboard(tk.Tk):
         self._dbg_exec["out"] = out
         out.insert("end", "Deploy or select a debug pod, then “Exec into selected”.\n"
                           "Line-oriented shell (ls/cat/curl work; vim/top do not).\n\n")
-
-        inbar = WrapBar(left, padding=(0, 4, 0, 0))
-        inbar.pack(fill="x")
-        inbar.add(ttk.Label(inbar, text="$"))
-        self._dbg_cmd_entry = ttk.Entry(inbar, width=50)
-        inbar.add(self._dbg_cmd_entry, padx=4)
-        self._dbg_cmd_entry.bind("<Return>", lambda e: self._dbg_exec_send())
-        inbar.add(ttk.Button(inbar, text="Send", command=self._dbg_exec_send))
         inbar.add(ttk.Button(inbar, text="🗑 Clear",
                              command=lambda: out.delete("1.0", "end")), padx=4)
 
-        # --- right: network targets + curl helper -------------------------
-        rtop = WrapBar(right, padding=(0, 0, 0, 4))
+        # --- right: network targets (grouped by namespace) + call builder ---
+        rtop = WrapBar(right, padding=(0, 0, 0, 2))
         rtop.pack(fill="x")
         rtop.add(ttk.Label(rtop, text="Network targets", font=("", 10, "bold")))
         rtop.add(ttk.Button(rtop, text="⟳ Refresh", command=self._dbg_refresh_targets),
                  padx=6)
+        rtop.add(ttk.Label(rtop, text="Namespace:"), padx=(8, 0))
+        self._dbg_target_ns = tk.StringVar(value=_ALL_NS_FILTER)
+        self._dbg_target_ns_box = ttk.Combobox(
+            rtop, textvariable=self._dbg_target_ns, width=20, state="readonly",
+            values=[_ALL_NS_FILTER])
+        rtop.add(self._dbg_target_ns_box, padx=4)
+        self._dbg_target_ns_box.bind("<<ComboboxSelected>>",
+                                     lambda e: self._dbg_render_targets())
         ttk.Label(right, foreground="#777", wraplength=360, justify="left",
-                  text="Services + NGINX VirtualServers/TransportServers with their "
-                       "in-cluster hostnames. Click one to build a curl, then "
-                       "“Run in pod”.").pack(anchor="w")
+                  text="Services (host = name.namespace.svc.cluster.local) + NGINX "
+                       "VirtualServers/TransportServers (host = spec.host), grouped by "
+                       "namespace. Click one to build a call, then “Run in pod”.").pack(anchor="w")
 
         twrap = ttk.Frame(right)
         twrap.pack(fill="both", expand=True, pady=(2, 4))
-        cols = ("kind", "namespace", "name", "host", "ports")
-        tree = ttk.Treeview(twrap, columns=cols, show="headings")
-        for c, w in zip(cols, (90, 110, 150, 240, 70)):
+        cols = ("kind", "name", "host", "ports")
+        tree = ttk.Treeview(twrap, columns=cols, show="tree headings")
+        tree.heading("#0", text="namespace")
+        tree.column("#0", width=150, anchor="w")
+        for c, w in zip(cols, (110, 150, 230, 60)):
             tree.heading(c, text=c)
             tree.column(c, width=w, anchor="w")
         tvs = ttk.Scrollbar(twrap, orient="vertical", command=tree.yview)
@@ -2994,6 +3021,7 @@ class Dashboard(tk.Tk):
         tvs.pack(side="right", fill="y")
         tree.bind("<<TreeviewSelect>>", lambda e: self._dbg_target_to_curl())
         self._dbg_targets_tree = tree
+        self._dbg_all_targets = []        # cached rows, re-rendered on ns filter change
 
         curlbar = WrapBar(right, padding=(0, 2, 0, 0))
         curlbar.pack(fill="x")
@@ -3012,8 +3040,11 @@ class Dashboard(tk.Tk):
 
         self._dbg_reload_images()
         self._dbg_exec_pump()
-        # Fill the namespace dropdown lazily so building the tab never blocks on kubectl.
+        # Fill the namespace dropdown + network targets lazily so building the tab
+        # never blocks on kubectl. Targets only load once a context is selected.
         self.after(300, self._dbg_refresh_namespaces)
+        self.after(400, lambda: self.context_var.get().strip()
+                   and self._dbg_refresh_targets())
 
     # -- Debugging: image list + namespaces --------------------------------
     def _dbg_default_pod_name(self) -> str:
@@ -3252,20 +3283,41 @@ class Dashboard(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _dbg_fill_targets(self, rows):
-        """Render the network-targets table."""
+        """Cache targets, refresh the namespace filter options, then render."""
+        self._dbg_all_targets = rows
+        namespaces = sorted({r[1] for r in rows if r[1]})
+        self._dbg_target_ns_box["values"] = [_ALL_NS_FILTER] + namespaces
+        if self._dbg_target_ns.get() not in self._dbg_target_ns_box["values"]:
+            self._dbg_target_ns.set(_ALL_NS_FILTER)
+        self._dbg_render_targets()
+
+    def _dbg_render_targets(self):
+        """Render cached targets grouped by namespace, honoring the ns filter."""
         tree = self._dbg_targets_tree
         for iid in tree.get_children(""):
             tree.delete(iid)
-        for r in rows:
-            tree.insert("", "end", values=r)
-        self.status.config(text=f"✓ {len(rows)} network target(s)")
+        ns_filter = self._dbg_target_ns.get()
+        rows = [r for r in self._dbg_all_targets
+                if ns_filter == _ALL_NS_FILTER or r[1] == ns_filter]
+        shown = 0
+        for ns in sorted({r[1] for r in rows}):
+            ns_rows = [r for r in rows if r[1] == ns]
+            parent = tree.insert("", "end", text=f"{ns or '—'}  ({len(ns_rows)})",
+                                 open=True)
+            for kind, _ns, name, host, ports in ns_rows:
+                tree.insert(parent, "end", values=(kind, name, host, ports))
+                shown += 1
+        self.status.config(text=f"✓ {shown} network target(s)")
 
     def _dbg_target_to_curl(self):
         """Build the connectivity command for the selected target + chosen tool."""
         sel = self._dbg_targets_tree.selection()
         if not sel:
             return
-        kind, ns, name, host, ports = self._dbg_targets_tree.item(sel[0], "values")
+        vals = self._dbg_targets_tree.item(sel[0], "values")
+        if not vals:                       # a namespace group header, not a target
+            return
+        kind, name, host, ports = vals
         # Services are plain HTTP on their port; ingress hosts (VS/TS) are TLS.
         secure = kind != "Service"
         port = (ports.split(",")[0].strip() if ports else "")

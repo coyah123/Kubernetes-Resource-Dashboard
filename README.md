@@ -188,15 +188,19 @@ troubleshooting without leaving the app:
 - **Deploy a debug pod** — pick an image, name the pod, choose a namespace, and
   **🚀 Deploy** (`kubectl run … --command -- sh -c 'sleep infinity'` so it stays
   Running). List/refresh pods and **🗑 Delete** them from the same panel.
-- **Embedded exec** — select a pod and **⇆ Exec into selected** to get a
-  line-oriented shell right in the app (same pipe-exec as the pod detail view;
-  `ls`/`cat`/`curl` work, full-screen TUIs don't).
-- **Network targets (right panel)** — every **Service** (with its
-  `name.namespace.svc.cluster.local` hostname) plus any NGINX **VirtualServers**
-  and **TransportServers** (with `spec.host`), so you can see hostnames at a
-  glance. Click a target to auto-build a connectivity command, then **▶ Run in
-  pod** to execute it inside the connected debug pod — testing connectivity while
-  keeping the whole target list in view.
+- **Embedded exec** — the left pane is sectioned **Deploy ▸ Debug pods ▸
+  Terminal**. The Debug pods list shows each pod's phase (so you can see what's
+  **Running**); select one and **⇆ Exec into selected** opens a line-oriented
+  shell in the Terminal section — connection status on top, output in the middle,
+  and the command box pinned to the bottom (`ls`/`cat`/`curl` work, full-screen
+  TUIs don't).
+- **Network targets (right panel)** — every **Service** (host =
+  `name.namespace.svc.cluster.local`) plus any NGINX **VirtualServers** and
+  **TransportServers** (host = `spec.host`), **grouped by namespace** with a
+  **Namespace** filter to narrow the list. Targets load automatically once a
+  context is selected (or hit **⟳ Refresh**). Click a target to auto-build a
+  connectivity command, then **▶ Run in pod** to execute it inside the connected
+  debug pod — testing connectivity while keeping the whole target list in view.
 - **Pick the call** — a **Tool** dropdown chooses how the command is formed:
   `curl`, `wget` (for images without curl), `nc` (port reachability), `ping`, or
   `nslookup` (DNS). Services build an HTTP call on their port; ingress hosts
