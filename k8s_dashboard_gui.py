@@ -1301,6 +1301,16 @@ class Dashboard(tk.Tk):
 
     def _rebuild_analysis_tabs(self):
         """(Re)build the four data tabs; leave the persistent Trends tab intact."""
+        # Remember which tab is open (by its label — the frames are rebuilt) so a
+        # Refresh stays where the user was instead of snapping back to Overview.
+        prev_tab_text = None
+        try:
+            cur = self.nb.select()
+            if cur:
+                prev_tab_text = self.nb.tab(cur, "text")
+        except tk.TclError:
+            prev_tab_text = None
+
         for f in self._analysis_frames:
             self.nb.forget(f)
             f.destroy()
@@ -1319,8 +1329,17 @@ class Dashboard(tk.Tk):
         self._trends_refresh_namespaces()
         # Rebuild the sidebar to match the (re)built set of tabs.
         self._rebuild_sidebar()
-        # Always land on Overview after a (re)build, not the persistent Trends tab.
-        if self._analysis_frames:
+        # Restore the previously-open tab (matched by label); fall back to Overview
+        # on first build or if that tab no longer exists.
+        restored = None
+        if prev_tab_text:
+            for tab_id in self.nb.tabs():
+                if self.nb.tab(tab_id, "text") == prev_tab_text:
+                    restored = tab_id
+                    break
+        if restored is not None:
+            self.nb.select(restored)
+        elif self._analysis_frames:
             self.nb.select(self._analysis_frames[0])
 
     # -- helpers -----------------------------------------------------------
@@ -4253,7 +4272,10 @@ class ResourceBrowser(ttk.Frame):
         # filtered client-side in _fill. Only truly namespaced kinds scope the query.
         want_ns = ns if (kind.namespaced and ns != "(all)") else ""
         all_ns = kind.namespaced and ns == "(all)"
-        need_ns_list = can_ns_filter and self._namespaces == ["(all)"]
+        # Always re-list namespaces for the current context (not just the first
+        # time): switching the cluster context or hitting Refresh must repopulate
+        # the Namespace dropdown, otherwise it keeps the previous context's list.
+        need_ns_list = can_ns_filter
 
         def work():
             try:
@@ -4279,6 +4301,10 @@ class ResourceBrowser(ttk.Frame):
                 if nslist:
                     self._namespaces = ["(all)"] + nslist
                     self.ns_box["values"] = self._namespaces
+                    # If the selected namespace vanished (e.g. context switched),
+                    # fall back to "(all)" so the box isn't stuck on a stale value.
+                    if self.ns_var.get() not in self._namespaces:
+                        self.ns_var.set("(all)")
                 if status == "err":
                     self.status.config(text=f"⚠ {payload}")
                 elif status == "action_ok":
