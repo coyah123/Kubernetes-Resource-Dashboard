@@ -1,6 +1,10 @@
 # Collected cluster snapshots — may contain sensitive infra details, never commit.
 data/
 
+# Saved debug image tags (Debugging tab) — may reference a private registry (ACR).
+debug_images.json
+**/debug_images.json
+
 # Python
 __pycache__/
 *.py[cod]

@@ -176,6 +176,28 @@ to confirm the new credentials work. (Env-var credentials only; interactive
 logins like `gcloud auth login` still run in your own shell — paste the resulting
 exports here afterward.)
 
+### Debugging tab
+
+A dedicated **Debugging** tab (next to **Trends**) for in-cluster network
+troubleshooting without leaving the app:
+
+- **Saved debug images** — paste an image tag (e.g. an ACR path) and **＋ Save to
+  list**; tags persist to `debug_images.json` in the data folder, which is
+  **gitignored** so a private registry path never lands in git. Deploy from the
+  **Image** dropdown of saved tags.
+- **Deploy a debug pod** — pick an image, name the pod, choose a namespace, and
+  **🚀 Deploy** (`kubectl run … --command -- sh -c 'sleep infinity'` so it stays
+  Running). List/refresh pods and **🗑 Delete** them from the same panel.
+- **Embedded exec** — select a pod and **⇆ Exec into selected** to get a
+  line-oriented shell right in the app (same pipe-exec as the pod detail view;
+  `ls`/`cat`/`curl` work, full-screen TUIs don't).
+- **Network targets (right panel)** — every **Service** (with its
+  `name.namespace.svc.cluster.local` hostname) plus any NGINX **VirtualServers**
+  and **TransportServers** (with `spec.host`), so you can see hostnames at a
+  glance. Click a target to auto-build a `curl` command, then **▶ Run in pod** to
+  execute it inside the connected debug pod — testing connectivity while keeping
+  the whole target list in view.
+
 **Secrets** get an extra **Get secret** tab: each `data` key is listed with its
 value **hidden by default** behind a **Reveal values** toggle, a **Decoder**
 dropdown (**Base64** first), and a per-key **Copy**. Non-text values render as

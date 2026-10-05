@@ -867,6 +867,68 @@ def parse_env_assignments(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Debugging — a saved list of debug image tags (e.g. from ACR).
+#
+# The Debugging tab deploys throwaway pods from these images; we persist the tags
+# the user pastes to a JSON file in the data folder (which is .gitignored) so a
+# private registry path never lands in git. Kept as free functions for testing.
+# ---------------------------------------------------------------------------
+def load_debug_images(path) -> list:
+    """Return the saved image tags (most-recent first); [] if the file is missing."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(x) for x in data] if isinstance(data, list) else []
+
+
+def save_debug_images(path, images) -> None:
+    """Write `images` (de-duplicated, order preserved) to the JSON file."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(list(dict.fromkeys(images)), indent=2), encoding="utf-8")
+
+
+def add_debug_image(path, tag: str) -> list:
+    """Add `tag` to the front of the saved list (moving an existing one up)."""
+    tag = tag.strip()
+    images = load_debug_images(path)
+    if not tag:
+        return images
+    if tag in images:
+        images.remove(tag)
+    images.insert(0, tag)
+    save_debug_images(path, images)
+    return images
+
+
+def debug_network_targets(context: str = "") -> list:
+    """
+    Gather curl-able targets for the Debugging tab as (kind, namespace, name,
+    host, ports) tuples: every Service (host = its in-cluster DNS name) plus any
+    NGINX VirtualServers/TransportServers (host = spec.host). CRDs that aren't
+    installed are simply skipped (list_items_safe returns []).
+    """
+    rows = []
+    for svc in kubectl_collect.list_items_safe("services", context=context):
+        meta = svc.get("metadata", {})
+        spec = svc.get("spec", {})
+        name, ns = meta.get("name", ""), meta.get("namespace", "")
+        ports = ",".join(str(p.get("port")) for p in (spec.get("ports") or [])
+                         if p.get("port") is not None)
+        host = f"{name}.{ns}.svc.cluster.local"
+        rows.append(("Service", ns, name, host, ports))
+    for kind, fq in (("VirtualServer", "virtualservers.k8s.nginx.org"),
+                     ("TransportServer", "transportservers.k8s.nginx.org")):
+        for it in kubectl_collect.list_items_safe(fq, context=context):
+            meta = it.get("metadata", {})
+            host = (it.get("spec") or {}).get("host", "") or "—"
+            rows.append((kind, meta.get("namespace", ""), meta.get("name", ""),
+                         host, ""))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # GUI — main window (Dashboard): control rows, sidebar nav, and the analysis
 # tabs (Overview / Nodes / Deployments / Pods / Resource Management / Trends).
 # The grouped browser + resource-kind registry live further down.
@@ -916,6 +978,13 @@ class Dashboard(tk.Tk):
         self._cap_after_id = None
         self._cap_q: queue.Queue = queue.Queue()
         self._cap_busy = False
+
+        # Debugging tab state (saved image tags + the embedded exec session).
+        self._dbg_images_path = folder / "debug_images.json"
+        self._dbg_procs: list = []        # exec Popens we own (killed on reconnect)
+        self._dbg_exec = {"proc": None, "q": queue.Queue(), "out": None,
+                          "status": None, "ns": "", "pod": ""}
+        self._dbg_targets_q: queue.Queue = queue.Queue()
 
         # --- Row 1: live cluster (kubectl on your PATH) -----------------------
         live = ttk.Frame(self, padding=(6, 6, 6, 2))
@@ -1004,8 +1073,9 @@ class Dashboard(tk.Tk):
         self.nb.pack(side="left", fill="both", expand=True)
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        # Persistent Trends tab (never torn down by data reloads).
+        # Persistent Trends + Debugging tabs (never torn down by data reloads).
         self._build_trends_tab()
+        self._build_debug_tab()
 
         self.load_contexts()
         # Always start empty — never auto-load a cached snapshot. The user picks a
@@ -1324,8 +1394,9 @@ class Dashboard(tk.Tk):
         for group in RESOURCE_GROUPS:
             self._build_group_tab(group)
         self._build_crd_tab()
-        # Keep Trends as the last tab.
+        # Keep the persistent Trends + Debugging tabs last (in that order).
         self.nb.insert("end", self._trends_frame)
+        self.nb.insert("end", self._debug_frame)
         self._trends_refresh_namespaces()
         # Rebuild the sidebar to match the (re)built set of tabs.
         self._rebuild_sidebar()
@@ -2791,6 +2862,400 @@ class Dashboard(tk.Tk):
         msg = ("No data yet — pick a context above and hit “Start capture”."
                if not self._history else f"No records for namespace “{ns}”.")
         self.trends_chart.set_series(series, y_fmt=y_fmt, empty_msg=msg)
+
+    # -- Debugging tab -----------------------------------------------------
+    def _build_debug_tab(self):
+        """
+        Debugging: deploy a throwaway pod from a saved image tag, exec into it in
+        an embedded shell, and run curl against cluster Services / NGINX
+        VirtualServers / TransportServers — with all those targets (and their
+        hostnames) listed on the right so you can test connectivity without
+        clicking around. Persists across data reloads like the Trends tab.
+        """
+        frame = ttk.Frame(self.nb)
+        self._debug_frame = frame
+        self.nb.add(frame, text="Debugging")
+
+        panes = ttk.Panedwindow(frame, orient="horizontal")
+        panes.pack(fill="both", expand=True, padx=6, pady=6)
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=3)
+        panes.add(right, weight=2)
+
+        # --- left: image list, deploy controls, pod list, exec terminal ---
+        imgbar = WrapBar(left, padding=(0, 0, 0, 4))
+        imgbar.pack(fill="x")
+        imgbar.add(ttk.Label(imgbar, text="New image tag:"))
+        self._dbg_new_img = tk.StringVar()
+        imgbar.add(ttk.Entry(imgbar, textvariable=self._dbg_new_img, width=40), padx=4)
+        imgbar.add(ttk.Button(imgbar, text="＋ Save to list",
+                              command=self._dbg_save_image))
+
+        depbar = WrapBar(left, padding=(0, 0, 0, 4))
+        depbar.pack(fill="x")
+        depbar.add(ttk.Label(depbar, text="Image:"))
+        self._dbg_image = tk.StringVar()
+        self._dbg_image_box = ttk.Combobox(depbar, textvariable=self._dbg_image,
+                                           width=38, state="readonly")
+        depbar.add(self._dbg_image_box, padx=4)
+        depbar.add(ttk.Label(depbar, text="Pod name:"), padx=(8, 0))
+        self._dbg_pod_name = tk.StringVar(value=self._dbg_default_pod_name())
+        depbar.add(ttk.Entry(depbar, textvariable=self._dbg_pod_name, width=22), padx=4)
+        depbar.add(ttk.Label(depbar, text="Namespace:"), padx=(8, 0))
+        self._dbg_ns = tk.StringVar(value="default")
+        self._dbg_ns_box = ttk.Combobox(depbar, textvariable=self._dbg_ns, width=20,
+                                        values=["default"])
+        depbar.add(self._dbg_ns_box, padx=4)
+        depbar.add(ttk.Button(depbar, text="🚀 Deploy debug pod",
+                              command=self._dbg_deploy))
+
+        podbar = WrapBar(left, padding=(0, 0, 0, 2))
+        podbar.pack(fill="x")
+        podbar.add(ttk.Label(podbar, text="Debug pods:"))
+        podbar.add(ttk.Button(podbar, text="⟳ Refresh", command=self._dbg_refresh_pods))
+        podbar.add(ttk.Button(podbar, text="⇆ Exec into selected",
+                              command=self._dbg_exec_selected), padx=4)
+        podbar.add(ttk.Button(podbar, text="🗑 Delete selected",
+                              command=self._dbg_delete_selected))
+        self._dbg_pods_list = tk.Listbox(left, height=4,
+                                         background="#0b0b0b", foreground="#e0e0e0")
+        self._dbg_pods_list.pack(fill="x", pady=(0, 4))
+
+        self._dbg_exec["status"] = ttk.Label(left, text="(not connected)", foreground="#777")
+        self._dbg_exec["status"].pack(anchor="w")
+
+        owrap = ttk.Frame(left)
+        owrap.pack(fill="both", expand=True)
+        out = tk.Text(owrap, wrap="char", font=("Consolas", 9),
+                      background="#0b0b0b", foreground="#e0e0e0", insertbackground="#e0e0e0")
+        ovs = ttk.Scrollbar(owrap, orient="vertical", command=out.yview)
+        out.configure(yscrollcommand=ovs.set)
+        out.pack(side="left", fill="both", expand=True)
+        ovs.pack(side="right", fill="y")
+        self._dbg_exec["out"] = out
+        out.insert("end", "Deploy or select a debug pod, then “Exec into selected”.\n"
+                          "Line-oriented shell (ls/cat/curl work; vim/top do not).\n\n")
+
+        inbar = WrapBar(left, padding=(0, 4, 0, 0))
+        inbar.pack(fill="x")
+        inbar.add(ttk.Label(inbar, text="$"))
+        self._dbg_cmd_entry = ttk.Entry(inbar, width=50)
+        inbar.add(self._dbg_cmd_entry, padx=4)
+        self._dbg_cmd_entry.bind("<Return>", lambda e: self._dbg_exec_send())
+        inbar.add(ttk.Button(inbar, text="Send", command=self._dbg_exec_send))
+        inbar.add(ttk.Button(inbar, text="🗑 Clear",
+                             command=lambda: out.delete("1.0", "end")), padx=4)
+
+        # --- right: network targets + curl helper -------------------------
+        rtop = WrapBar(right, padding=(0, 0, 0, 4))
+        rtop.pack(fill="x")
+        rtop.add(ttk.Label(rtop, text="Network targets", font=("", 10, "bold")))
+        rtop.add(ttk.Button(rtop, text="⟳ Refresh", command=self._dbg_refresh_targets),
+                 padx=6)
+        ttk.Label(right, foreground="#777", wraplength=360, justify="left",
+                  text="Services + NGINX VirtualServers/TransportServers with their "
+                       "in-cluster hostnames. Click one to build a curl, then "
+                       "“Run in pod”.").pack(anchor="w")
+
+        twrap = ttk.Frame(right)
+        twrap.pack(fill="both", expand=True, pady=(2, 4))
+        cols = ("kind", "namespace", "name", "host", "ports")
+        tree = ttk.Treeview(twrap, columns=cols, show="headings")
+        for c, w in zip(cols, (90, 110, 150, 240, 70)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w")
+        tvs = ttk.Scrollbar(twrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=tvs.set)
+        tree.pack(side="left", fill="both", expand=True)
+        tvs.pack(side="right", fill="y")
+        tree.bind("<<TreeviewSelect>>", lambda e: self._dbg_target_to_curl())
+        self._dbg_targets_tree = tree
+
+        curlbar = WrapBar(right, padding=(0, 2, 0, 0))
+        curlbar.pack(fill="x")
+        self._dbg_curl = tk.StringVar(value="curl -s http://")
+        curlbar.add(ttk.Entry(curlbar, textvariable=self._dbg_curl, width=40), padx=(0, 4))
+        curlbar.add(ttk.Button(curlbar, text="▶ Run in pod", command=self._dbg_run_curl))
+        curlbar.add(ttk.Button(curlbar, text="Copy", command=lambda: (
+            self.clipboard_clear(), self.clipboard_append(self._dbg_curl.get()))), padx=4)
+
+        self._dbg_reload_images()
+        self._dbg_exec_pump()
+        # Fill the namespace dropdown lazily so building the tab never blocks on kubectl.
+        self.after(300, self._dbg_refresh_namespaces)
+
+    # -- Debugging: image list + namespaces --------------------------------
+    def _dbg_default_pod_name(self) -> str:
+        """A unique-ish default debug pod name (debug-HHMMSS)."""
+        return "debug-" + time.strftime("%H%M%S")
+
+    def _dbg_reload_images(self):
+        """Refresh the image dropdown from the saved (gitignored) tags file."""
+        images = load_debug_images(self._dbg_images_path)
+        self._dbg_image_box["values"] = images
+        if images and self._dbg_image.get() not in images:
+            self._dbg_image.set(images[0])
+
+    def _dbg_save_image(self):
+        """Save the pasted tag to the gitignored list and select it."""
+        tag = self._dbg_new_img.get().strip()
+        if not tag:
+            messagebox.showinfo("No tag", "Paste an image tag first.")
+            return
+        add_debug_image(self._dbg_images_path, tag)
+        self._dbg_new_img.set("")
+        self._dbg_reload_images()
+        self._dbg_image.set(tag)
+        self.status.config(text=f"✓ saved debug image: {tag}")
+
+    def _dbg_refresh_namespaces(self):
+        """Populate the Debugging namespace dropdown for the current context (off-thread)."""
+        ctx = self.context_var.get().strip()
+
+        def work():
+            try:
+                self._dbg_targets_q.put(("namespaces", None,
+                                         kubectl_collect.list_namespaces(ctx)))
+            except Exception:  # noqa: BLE001 — best-effort dropdown fill
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- Debugging: deploy / list / delete pods ----------------------------
+    def _dbg_deploy(self):
+        """kubectl run a debug pod from the selected image, off the UI thread."""
+        image = self._dbg_image.get().strip()
+        name = self._dbg_pod_name.get().strip()
+        ns = self._dbg_ns.get().strip()
+        if not image:
+            messagebox.showinfo("No image", "Save and pick an image tag first.")
+            return
+        if not name:
+            messagebox.showinfo("No name", "Give the debug pod a name.")
+            return
+        ctx = self.context_var.get().strip()
+        self.status.config(text=f"⏳ deploying {name} ({image})…")
+
+        def work():
+            try:
+                kubectl_collect.create_debug_pod(name, image, namespace=ns, context=ctx)
+                self._dbg_targets_q.put(("deployed", name, None))
+            except Exception as e:  # noqa: BLE001
+                self._dbg_targets_q.put(("deploy_err", name, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _dbg_refresh_pods(self):
+        """List pods in the selected namespace into the debug-pods listbox."""
+        ctx = self.context_var.get().strip()
+        ns = self._dbg_ns.get().strip()
+
+        def work():
+            try:
+                items = kubectl_collect.list_items("pods", namespace=ns, context=ctx)
+                names = [f"{_meta(p).get('name', '')}  "
+                         f"[{(p.get('status') or {}).get('phase', '?')}]"
+                         for p in items]
+                self._dbg_targets_q.put(("pods", ns, names))
+            except Exception as e:  # noqa: BLE001
+                self._dbg_targets_q.put(("pods_err", ns, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _dbg_selected_pod(self) -> str:
+        """The pod name chosen in the listbox (strips the trailing phase marker)."""
+        sel = self._dbg_pods_list.curselection()
+        if not sel:
+            return ""
+        return self._dbg_pods_list.get(sel[0]).split()[0]
+
+    def _dbg_delete_selected(self):
+        """Delete the selected debug pod after confirmation."""
+        name = self._dbg_selected_pod()
+        if not name:
+            messagebox.showinfo("No pod", "Select a pod in the list first.")
+            return
+        ns = self._dbg_ns.get().strip()
+        if not messagebox.askyesno("Delete pod",
+                                   f"Delete pod {name} in namespace {ns}?"):
+            return
+        ctx = self.context_var.get().strip()
+        self.status.config(text=f"⏳ deleting {name}…")
+
+        def work():
+            try:
+                kubectl_collect.delete_pod(name, namespace=ns, context=ctx)
+                self._dbg_targets_q.put(("deleted", name, None))
+            except Exception as e:  # noqa: BLE001
+                self._dbg_targets_q.put(("delete_err", name, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- Debugging: embedded exec session ----------------------------------
+    def _dbg_exec_selected(self):
+        """Open an embedded shell into the selected debug pod."""
+        name = self._dbg_selected_pod()
+        if not name:
+            messagebox.showinfo("No pod", "Select a pod in the list first.")
+            return
+        self._dbg_exec["ns"] = self._dbg_ns.get().strip()
+        self._dbg_exec["pod"] = name
+        self._dbg_exec_start()
+
+    def _dbg_exec_start(self):
+        """(Re)connect the exec shell to the current debug pod."""
+        st = self._dbg_exec
+        if not st["pod"]:
+            return
+        self._dbg_terminate(st["proc"])
+        shell = "sh"
+        try:
+            proc = kubectl_collect.popen_exec(st["ns"], st["pod"], shell,
+                                              context=self.context_var.get().strip())
+        except Exception as e:  # noqa: BLE001
+            st["out"].insert("end", f"⚠ could not exec into {st['pod']}: {e}\n")
+            return
+        st["proc"] = proc
+        self._dbg_procs.append(proc)
+        st["status"].config(text=f"● connected to {st['pod']} (-n {st['ns']})")
+        st["out"].insert("end", f"\n— connected to {st['pod']} —\n")
+        st["out"].see("end")
+
+        def reader(p):
+            try:
+                for line in p.stdout:
+                    st["q"].put(line)
+            except Exception:  # noqa: BLE001
+                pass
+            st["q"].put(("__eof__",))
+
+        threading.Thread(target=reader, args=(proc,), daemon=True).start()
+
+    def _dbg_exec_send(self, cmd=None):
+        """Write a command line to the debug pod's shell stdin (echoing it)."""
+        st = self._dbg_exec
+        if cmd is None:
+            cmd = self._dbg_cmd_entry.get()
+            self._dbg_cmd_entry.delete(0, "end")
+        proc = st["proc"]
+        if proc is None or proc.poll() is not None:
+            st["out"].insert("end", "⚠ no live shell — “Exec into selected” first.\n")
+            st["out"].see("end")
+            return
+        st["out"].insert("end", f"$ {cmd}\n")
+        st["out"].see("end")
+        try:
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+        except Exception as e:  # noqa: BLE001
+            st["out"].insert("end", f"⚠ write failed: {e}\n")
+
+    def _dbg_exec_pump(self):
+        """UI-thread timer: flush shell output + drain deploy/list/delete results."""
+        st = self._dbg_exec
+        appended = False
+        try:
+            while True:
+                item = st["q"].get_nowait()
+                if isinstance(item, tuple):   # EOF
+                    st["status"].config(text="session ended")
+                    continue
+                st["out"].insert("end", item)
+                appended = True
+        except queue.Empty:
+            pass
+        if appended:
+            st["out"].see("end")
+
+        # Drain background deploy/list/delete/target results.
+        try:
+            while True:
+                kind, key, payload = self._dbg_targets_q.get_nowait()
+                self._dbg_handle_result(kind, key, payload)
+        except queue.Empty:
+            pass
+        self.after(150, self._dbg_exec_pump)
+
+    def _dbg_handle_result(self, kind, key, payload):
+        """Apply one background result from the debug worker threads."""
+        if kind == "deployed":
+            self.status.config(text=f"✓ deployed {key}")
+            self._dbg_pod_name.set(self._dbg_default_pod_name())
+            self._dbg_refresh_pods()
+        elif kind == "deploy_err":
+            self.status.config(text=f"⚠ deploy failed: {key}")
+            messagebox.showerror("Deploy failed", str(payload))
+        elif kind == "deleted":
+            self.status.config(text=f"✓ deleted {key}")
+            self._dbg_refresh_pods()
+        elif kind == "delete_err":
+            messagebox.showerror("Delete failed", str(payload))
+        elif kind == "pods":
+            self._dbg_pods_list.delete(0, "end")
+            for n in payload:
+                self._dbg_pods_list.insert("end", n)
+        elif kind == "pods_err":
+            self.status.config(text=f"⚠ list pods failed: {payload}")
+        elif kind == "targets":
+            self._dbg_fill_targets(payload)
+        elif kind == "targets_err":
+            self.status.config(text=f"⚠ list targets failed: {payload}")
+        elif kind == "namespaces" and payload:
+            self._dbg_ns_box["values"] = payload
+            if self._dbg_ns.get() not in payload:
+                self._dbg_ns.set("default" if "default" in payload else payload[0])
+
+    # -- Debugging: network targets + curl ---------------------------------
+    def _dbg_refresh_targets(self):
+        """List Services + NGINX VirtualServers/TransportServers off-thread."""
+        ctx = self.context_var.get().strip()
+        self.status.config(text="⏳ listing network targets…")
+
+        def work():
+            try:
+                rows = debug_network_targets(ctx)
+                self._dbg_targets_q.put(("targets", None, rows))
+            except Exception as e:  # noqa: BLE001
+                self._dbg_targets_q.put(("targets_err", None, e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _dbg_fill_targets(self, rows):
+        """Render the network-targets table."""
+        tree = self._dbg_targets_tree
+        for iid in tree.get_children(""):
+            tree.delete(iid)
+        for r in rows:
+            tree.insert("", "end", values=r)
+        self.status.config(text=f"✓ {len(rows)} network target(s)")
+
+    def _dbg_target_to_curl(self):
+        """Build a curl command for the selected target into the curl entry."""
+        sel = self._dbg_targets_tree.selection()
+        if not sel:
+            return
+        kind, ns, name, host, ports = self._dbg_targets_tree.item(sel[0], "values")
+        if kind == "Service":
+            port = (ports.split(",")[0] if ports else "80").strip() or "80"
+            self._dbg_curl.set(f"curl -s http://{host}:{port}/")
+        else:  # VirtualServer / TransportServer — hit the host over TLS
+            self._dbg_curl.set(f"curl -s -k https://{host}/")
+
+    def _dbg_run_curl(self):
+        """Send the curl command into the connected debug pod's shell."""
+        cmd = self._dbg_curl.get().strip()
+        if not cmd:
+            return
+        self._dbg_exec_send(cmd)
+
+    def _dbg_terminate(self, proc):
+        """Best-effort terminate of an exec Popen we own."""
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # kubectl types whose detail view gets a live "Pods" tab (what it runs/deploys).

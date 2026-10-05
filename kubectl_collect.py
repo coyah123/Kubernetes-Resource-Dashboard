@@ -190,6 +190,41 @@ def list_namespaces(context: str = "") -> list[str]:
     return sorted(names)
 
 
+def list_items_safe(ktype: str, *, context: str = "", timeout: int = 20) -> list[dict]:
+    """`list_items` across all namespaces but returning [] instead of raising.
+
+    Used for optional resources (e.g. NGINX VirtualServer/TransportServer CRDs)
+    that may not be installed — a missing CRD shouldn't be an error, just empty.
+    """
+    try:
+        return list_items(ktype, all_namespaces=True, context=context, timeout=timeout)
+    except KubectlError:
+        return []
+
+
+def create_debug_pod(name: str, image: str, *, namespace: str = "", context: str = "",
+                     timeout: int = 60) -> str:
+    """
+    `kubectl run` a long-lived debug pod from `image` (overriding its entrypoint
+    with `sh -c 'sleep infinity'` so it stays Running to exec into). Returns the
+    command's stdout; raises KubectlError on failure (e.g. name already in use).
+    """
+    args = ["run", name, f"--image={image}", "--restart=Never"]
+    if namespace:
+        args += ["-n", namespace]
+    args += ["--command", "--", "sh", "-c", "sleep infinity"]
+    return _run(args, context=context, timeout=timeout)
+
+
+def delete_pod(name: str, *, namespace: str = "", context: str = "",
+               timeout: int = 60) -> str:
+    """`kubectl delete pod <name>` (optionally namespaced). Raises on failure."""
+    args = ["delete", "pod", name]
+    if namespace:
+        args += ["-n", namespace]
+    return _run(args, context=context, timeout=timeout)
+
+
 def popen_logs(namespace: str, pod: str, *, context: str = "",
                tail: int = 200, follow: bool = True) -> subprocess.Popen:
     """
