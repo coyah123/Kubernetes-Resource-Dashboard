@@ -152,11 +152,29 @@ and **Shell: bash**, via `kubectl exec -i`. Controllers (Deployments, StatefulSe
 DaemonSets, ReplicaSets, Jobs) and Nodes also get a **Pods** tab listing what they
 run, itself clickable.
 
-**Live edit** — every detail view has an **✎ Edit (kubectl edit)** button that
-launches `kubectl edit <kind>/<name>` in a **new terminal window**. It's not a
-built-in editor; it hands off to kubectl's own flow using your
-`$KUBE_EDITOR`/`$EDITOR` (Notepad on Windows) — save applies to the cluster, quit
-without saving cancels. Click **⟳ Refresh** on a tab afterward to see the result.
+**Live edit** — every detail view has an **✎ Edit ▾** dropdown offering two ways
+to edit `<kind>/<name>`:
+
+- **Edit in app (built-in YAML editor)** — opens the resource's live YAML in a
+  dialog; **✔ Apply** pipes it to `kubectl apply -f -` with server-side
+  validation. No external terminal or `$EDITOR` needed, so it works the same on
+  every platform.
+- **Edit in external terminal (kubectl edit)** — launches `kubectl edit` in a
+  **new terminal window**, handing off to kubectl's own flow using your
+  `$KUBE_EDITOR`/`$EDITOR` (Notepad on Windows). Save applies, quit-without-save
+  cancels.
+
+Click **⟳ Refresh** on a tab afterward to see the result.
+
+**Update credentials without restarting** — the top **Credentials → Update
+credentials…** menu opens a dialog where you paste the same credential lines
+you'd run in a shell (`export KEY=VALUE`, `set KEY=VALUE`, `$env:KEY="VALUE"`, or
+bare `KEY=VALUE`). **Apply** writes them into the running app's environment, so
+the next kubectl call uses the refreshed token/`KUBECONFIG`/`KUBECTL`/cloud creds
+— no need to quit and relaunch. **✔ Apply & verify** also runs `kubectl get ns`
+to confirm the new credentials work. (Env-var credentials only; interactive
+logins like `gcloud auth login` still run in your own shell — paste the resulting
+exports here afterward.)
 
 **Secrets** get an extra **Get secret** tab: each `data` key is listed with its
 value **hidden by default** behind a **Reveal values** toggle, a **Decoder**

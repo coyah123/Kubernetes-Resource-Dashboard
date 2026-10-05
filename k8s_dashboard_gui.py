@@ -731,6 +731,142 @@ def add_export_buttons(toolbar, tree, *, status_cb=None, side="right"):
 
 
 # ---------------------------------------------------------------------------
+# WrapBar — a horizontal toolbar whose children reflow onto extra rows when the
+# window is too narrow to fit them all on one line.
+#
+# Why this exists: tkinter's pack()/grid() don't wrap. A plain `pack(side=left)`
+# row of buttons/labels simply runs off the edge, so the user had to stretch the
+# window wide to see every option. WrapBar lays its children out left-to-right
+# with place(), and on every <Configure> (resize) recomputes the layout, pushing
+# anything that no longer fits down to the next row. The bar's height grows/shrinks
+# to match, so all options stay visible at any width.
+#
+# Usage — build children with the bar as their master, then hand them to add():
+#     bar = WrapBar(parent, padding=4)
+#     bar.pack(fill="x")
+#     bar.add(ttk.Label(bar, text="Type:"))
+#     bar.add(combo, padx=4)                 # padx accepts an int or (left, right)
+# Don't call .pack()/.grid() on the children yourself — add() positions them.
+# ---------------------------------------------------------------------------
+def _pad_pair(p):
+    """Normalize a tkinter-style pad (int or (lo, hi)) into an (lo, hi) tuple."""
+    if isinstance(p, (tuple, list)):
+        return p[0], p[1]
+    return p, p
+
+
+class WrapBar(ttk.Frame):
+    """A toolbar frame that wraps its children onto new rows when too narrow."""
+
+    def __init__(self, master, *, padx=2, pady=2, **kw):
+        super().__init__(master, **kw)
+        self._items = []                 # [(widget, (padx_lo, padx_hi), (pady_lo, pady_hi))]
+        self._default_padx = padx
+        self._default_pady = pady
+        self._reflow_pending = False
+        self.bind("<Configure>", lambda e: self._schedule_reflow())
+
+    def add(self, widget, *, padx=None, pady=None):
+        """Register `widget` (already built with this bar as master) in the flow."""
+        return self.insert(len(self._items), widget, padx=padx, pady=pady)
+
+    def insert(self, index, widget, *, padx=None, pady=None):
+        """Insert `widget` at position `index` in the flow (0 = front)."""
+        self._items.insert(index, (
+            widget,
+            _pad_pair(self._default_padx if padx is None else padx),
+            _pad_pair(self._default_pady if pady is None else pady),
+        ))
+        self._schedule_reflow()
+        return widget
+
+    def _schedule_reflow(self):
+        # Coalesce the storm of <Configure> events a resize produces into one pass.
+        if not self._reflow_pending:
+            self._reflow_pending = True
+            self.after_idle(self._reflow)
+
+    def _reflow(self):
+        self._reflow_pending = False
+        if not self.winfo_exists():
+            return
+        avail = self.winfo_width()
+        if avail <= 1:                   # not mapped/sized yet — wait for a real width
+            return
+        x = y = row_h = 0
+        for widget, (px_lo, px_hi), (py_lo, py_hi) in self._items:
+            w = widget.winfo_reqwidth() + px_lo + px_hi
+            h = widget.winfo_reqheight() + py_lo + py_hi
+            if x + w > avail and x > 0:   # doesn't fit — wrap (but never on a row's 1st item)
+                x = 0
+                y += row_h
+                row_h = 0
+            widget.place(x=x + px_lo, y=y + py_lo)
+            x += w
+            row_h = max(row_h, h)
+        total = y + row_h
+        if self.winfo_reqheight() != total:
+            self.configure(height=total)
+
+
+# ---------------------------------------------------------------------------
+# Credentials — parse pasted shell/PowerShell env assignments.
+#
+# Why this exists: the app shells out to kubectl, and every subprocess inherits
+# this process's os.environ (no call passes env=). So when a token/kubeconfig in
+# the environment expires, you used to have to quit, re-export in your shell, and
+# relaunch. Instead, the Credentials dialog lets you paste the same `export …`
+# lines you'd type in a terminal; we parse them here and write them into
+# os.environ, so every later kubectl call picks up the fresh credentials — no
+# restart. Kept as a free function (not UI) so it can be unit-tested.
+# ---------------------------------------------------------------------------
+_ENV_ASSIGN_RES = (
+    re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$"),      # bash/zsh/sh
+    re.compile(r"^\s*set\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$"),         # cmd.exe
+    re.compile(r"^\s*\$env:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$"),   # PowerShell
+    re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$"),               # bare KEY=VALUE
+)
+
+
+def _strip_env_quotes(val: str) -> str:
+    """Strip one layer of matching surrounding quotes and a trailing ';' from a value."""
+    val = val.strip()
+    if val.endswith(";"):
+        val = val[:-1].rstrip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return val
+
+
+def parse_env_assignments(text: str) -> dict:
+    """
+    Parse pasted credential lines into a {KEY: VALUE} dict.
+
+    Accepts, one assignment per line, any of:
+        export KEY=VALUE        set KEY=VALUE        $env:KEY="VALUE"       KEY=VALUE
+    Blank lines and `#` comments are ignored; surrounding quotes and a trailing
+    `;` are stripped from values. Raises ValueError listing any lines that match
+    none of the forms, so the caller can show the user exactly what to fix.
+    """
+    out: dict = {}
+    bad: list = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for rx in _ENV_ASSIGN_RES:
+            m = rx.match(line)
+            if m:
+                out[m.group(1)] = _strip_env_quotes(m.group(2))
+                break
+        else:
+            bad.append(raw.rstrip())
+    if bad:
+        raise ValueError("Couldn't parse these line(s):\n  " + "\n  ".join(bad))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # GUI — main window (Dashboard): control rows, sidebar nav, and the analysis
 # tabs (Overview / Nodes / Deployments / Pods / Resource Management / Trends).
 # The grouped browser + resource-kind registry live further down.
@@ -762,6 +898,16 @@ class Dashboard(tk.Tk):
         self._result_q: queue.Queue = queue.Queue()
         self._busy = False
         self._analysis_frames: list = []
+
+        # Top menubar. Credentials → Update credentials… refreshes expired
+        # tokens/kubeconfig in this process's env without a restart (see
+        # _open_credentials_dialog).
+        menubar = tk.Menu(self)
+        cred_menu = tk.Menu(menubar, tearoff=False)
+        cred_menu.add_command(label="Update credentials…",
+                              command=self._open_credentials_dialog)
+        menubar.add_cascade(label="Credentials", menu=cred_menu)
+        self.config(menu=menubar)
 
         # Trends / history capture state
         self._history_path = folder / trends.HISTORY_FILENAME
@@ -944,6 +1090,111 @@ class Dashboard(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(self.cmd_var.get())
         self.status.config(text="✓ command copied to clipboard")
+
+    # -- credentials -------------------------------------------------------
+    def _open_credentials_dialog(self):
+        """
+        Paste `export …`/`set …`/`$env:…`/`KEY=VALUE` lines to refresh credentials
+        (tokens, KUBECONFIG, the KUBECTL override, cloud creds, …) in THIS running
+        process without restarting. We write them into os.environ, which every
+        later kubectl/openssl subprocess inherits — so the fix takes effect on the
+        next Refresh. "Apply & verify" immediately runs `kubectl get ns` to prove
+        the new credentials work.
+        """
+        win = tk.Toplevel(self)
+        win.title("Update credentials")
+        win.geometry("680x460")
+        win.transient(self)
+
+        ttk.Label(win, padding=(8, 8, 8, 0), justify="left", wraplength=640,
+                  text="Paste the same export lines you'd run in your shell, then "
+                       "Apply. They update this app's environment, so the next "
+                       "kubectl call uses them — no restart needed.\n"
+                       "Accepts:  export KEY=VALUE   |   set KEY=VALUE   |   "
+                       "$env:KEY=\"VALUE\"   |   KEY=VALUE   (# comments ignored)."
+                  ).pack(fill="x")
+
+        wrap = ttk.Frame(win, padding=8)
+        wrap.pack(fill="both", expand=True)
+        txt = tk.Text(wrap, wrap="none", font=("Consolas", 10), undo=True, height=10,
+                      background="#111", foreground="#ddd", insertbackground="#ddd")
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vs.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        txt.focus_set()
+
+        status = ttk.Label(win, padding=(8, 0), foreground="#555", justify="left",
+                           wraplength=640, text="")
+        status.pack(fill="x")
+
+        reload_var = tk.BooleanVar(value=True)
+        opts = ttk.Frame(win, padding=(8, 2))
+        opts.pack(fill="x")
+        ttk.Checkbutton(opts, text="Reload cluster contexts after applying",
+                        variable=reload_var).pack(side="left")
+
+        btns = ttk.Frame(win, padding=8)
+        btns.pack(fill="x")
+        verify_q: queue.Queue = queue.Queue()
+
+        def apply(verify):
+            try:
+                env = parse_env_assignments(txt.get("1.0", "end-1c"))
+            except ValueError as e:
+                messagebox.showerror("Can't parse", str(e), parent=win)
+                return
+            if not env:
+                messagebox.showinfo("Nothing to apply",
+                                    "No KEY=VALUE assignments found.", parent=win)
+                return
+            for k, v in env.items():
+                os.environ[k] = v
+            # Report which keys changed, masking the secret values.
+            summary = ", ".join(f"{k} ({len(v)} chars)" for k, v in env.items())
+            status.config(text=f"✓ applied {len(env)} var(s): {summary}")
+            if reload_var.get():
+                self.load_contexts()
+            self.status.config(text=f"✓ credentials updated ({len(env)} env var(s))")
+            if not verify:
+                return
+            status.config(text="⏳ verifying with `kubectl get ns`…")
+            apply_btn.state(["disabled"])
+            verify_btn.state(["disabled"])
+
+            def work():
+                try:
+                    kubectl_collect.run_text(
+                        ["get", "ns"], context=self.context_var.get())
+                    verify_q.put(None)
+                except Exception as e:  # noqa: BLE001 — surfaced in the dialog
+                    verify_q.put(e)
+
+            def poll():
+                try:
+                    err = verify_q.get_nowait()
+                except queue.Empty:
+                    win.after(100, poll)
+                    return
+                apply_btn.state(["!disabled"])
+                verify_btn.state(["!disabled"])
+                if err is None:
+                    status.config(text="✓ verified — new credentials work. "
+                                       "You can close this and Refresh.")
+                else:
+                    status.config(text="⚠ verify failed — credentials may still be "
+                                       "wrong/expired. See the popup.")
+                    messagebox.showerror("Verify failed", str(err), parent=win)
+
+            threading.Thread(target=work, daemon=True).start()
+            win.after(100, poll)
+
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+        verify_btn = ttk.Button(btns, text="✔ Apply & verify",
+                                command=lambda: apply(True))
+        verify_btn.pack(side="right", padx=6)
+        apply_btn = ttk.Button(btns, text="Apply", command=lambda: apply(False))
+        apply_btn.pack(side="right")
 
     # -- live cluster ------------------------------------------------------
     def load_contexts(self):
@@ -1558,9 +1809,9 @@ class Dashboard(tk.Tk):
 
         # View switcher — same tree/data, but each view shows only its relevant
         # column group so the table isn't 18 columns wide all at once.
-        view_bar = ttk.Frame(list_frame, padding=(4, 0, 4, 2))
+        view_bar = WrapBar(list_frame, padding=(4, 0, 4, 2))
         view_bar.pack(fill="x")
-        ttk.Label(view_bar, text="View:").pack(side="left")
+        view_bar.add(ttk.Label(view_bar, text="View:"))
 
         cols = ("sel", "open", "node", "pool", "ready", "sched", "pods",
                 "ip used", "ip alloc", "ip left", "ip used%",
@@ -1612,8 +1863,8 @@ class Dashboard(tk.Tk):
                 net_note.pack_forget()
 
         for name in views:
-            ttk.Radiobutton(view_bar, text=name, value=name, variable=view_var,
-                            command=lambda n=name: set_view(n)).pack(side="left", padx=2)
+            view_bar.add(ttk.Radiobutton(view_bar, text=name, value=name, variable=view_var,
+                                         command=lambda n=name: set_view(n)))
 
         def refill():
             ms.reset()
@@ -2761,11 +3012,11 @@ class ResourceDetailView(ttk.Frame):
         nsargs = ["-n", namespace] if namespace else []
         crumb = (f"{namespace} / " if namespace else "") + f"{kind}/{name}"
 
-        header = ttk.Frame(self, padding=(4, 4, 4, 0))
+        header = WrapBar(self, padding=(4, 4, 4, 0))
         header.pack(fill="x")
         if on_back is not None:
-            ttk.Button(header, text="← Back", command=on_back).pack(side="left")
-        ttk.Label(header, text=f"  {crumb}", font=("", 10, "bold")).pack(side="left")
+            header.add(ttk.Button(header, text="← Back", command=on_back))
+        header.add(ttk.Label(header, text=f"  {crumb}", font=("", 10, "bold")))
         # Edit: let the user choose an in-app YAML editor (apply -f -) or hand off
         # to `kubectl edit` in a real terminal (see _edit_in_app / _launch_edit).
         edit_mb = ttk.Menubutton(header, text="✎ Edit ▾")
@@ -2775,7 +3026,7 @@ class ResourceDetailView(ttk.Frame):
         edit_menu.add_command(label="Edit in external terminal (kubectl edit)",
                               command=self._launch_edit)
         edit_mb["menu"] = edit_menu
-        edit_mb.pack(side="right")
+        header.add(edit_mb, padx=6)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -3898,45 +4149,48 @@ class ResourceBrowser(ttk.Frame):
         self._list = ttk.Frame(self)
         self._list.pack(fill="both", expand=True)
 
-        bar = ttk.Frame(self._list, padding=4)
+        bar = WrapBar(self._list, padding=4)
         bar.pack(fill="x")
-        ttk.Label(bar, text="Type:").pack(side="left")
+        self._filter_bar = bar                       # subclasses extend this row
+        self._type_label = ttk.Label(bar, text="Type:")
+        bar.add(self._type_label)
         self.kind_var = tk.StringVar(value=kinds[0].label if kinds else "")
         self.kind_box = ttk.Combobox(bar, textvariable=self.kind_var, width=30,
                                      state="readonly", values=[k.label for k in kinds])
-        self.kind_box.pack(side="left", padx=4)
+        bar.add(self.kind_box, padx=4)
         self.kind_box.bind("<<ComboboxSelected>>", lambda e: self._reload())
 
-        ttk.Label(bar, text="Namespace:").pack(side="left", padx=(10, 0))
+        bar.add(ttk.Label(bar, text="Namespace:"), padx=(10, 0))
         self.ns_var = tk.StringVar(value="(all)")
         self.ns_box = ttk.Combobox(bar, textvariable=self.ns_var, width=22,
                                    state="readonly", values=self._namespaces)
-        self.ns_box.pack(side="left", padx=4)
+        bar.add(self.ns_box, padx=4)
         self.ns_box.bind("<<ComboboxSelected>>", lambda e: self._reload())
-        ttk.Button(bar, text="⟳ Refresh", command=self._reload).pack(side="left", padx=6)
+        bar.add(ttk.Button(bar, text="⟳ Refresh", command=self._reload), padx=6)
         self.status = ttk.Label(bar, text="")
-        self.status.pack(side="left", padx=8)
+        bar.add(self.status, padx=8)
 
-        act = ttk.Frame(self._list, padding=(4, 0, 4, 4))
+        act = WrapBar(self._list, padding=(4, 0, 4, 4))
         act.pack(fill="x")
         self.scale_btn = ttk.Button(act, text="Scale…", command=self._do_scale)
         self.restart_btn = ttk.Button(act, text="Rollout restart", command=self._do_restart)
         self.delete_btn = ttk.Button(act, text="Delete…", command=self._do_delete)
-        self.scale_btn.pack(side="left")
-        self.restart_btn.pack(side="left", padx=4)
-        self.delete_btn.pack(side="left")
+        act.add(self.scale_btn)
+        act.add(self.restart_btn, padx=4)
+        act.add(self.delete_btn)
         # Only shown on kinds that declare reconcilable (PVCs) with a callback wired.
         self.reconcile_btn = ttk.Button(act, text="Reconcile Multi-Attach…",
                                         command=self._do_reconcile)
         if self._on_reconcile is not None:
-            self.reconcile_btn.pack(side="left", padx=4)
-        ttk.Label(act, text="  (double-click a row to open it here; click ⧉ for a new window)"
-                  ).pack(side="left", padx=6)
+            act.add(self.reconcile_btn, padx=4)
+        act.add(ttk.Label(act, text="  (double-click a row to open it here; "
+                          "click ⧉ for a new window)"), padx=6)
         # Export the current view (respects the Type/Namespace filters on screen).
-        ttk.Button(act, text="⬇ XLSX", command=lambda: self._export("xlsx")).pack(side="right")
-        ttk.Button(act, text="⬇ CSV", command=lambda: self._export("csv")
-                   ).pack(side="right", padx=(4, 0))
-        ttk.Label(act, text="Export:").pack(side="right", padx=(0, 4))
+        # In the wrapping bar these flow after the actions rather than hugging the
+        # right edge, so they stay visible when the window is narrow.
+        act.add(ttk.Label(act, text="Export:"), padx=(10, 4))
+        act.add(ttk.Button(act, text="⬇ CSV", command=lambda: self._export("csv")))
+        act.add(ttk.Button(act, text="⬇ XLSX", command=lambda: self._export("xlsx")), padx=(4, 0))
 
         self._table = ttk.Frame(self._list)
         self._table.pack(fill="both", expand=True)
@@ -4360,24 +4614,23 @@ class CustomResourceBrowser(ResourceBrowser):
         self._crd_kinds: list = []            # every discovered CRD as a Kind
         self._visible: dict = {}              # Kind-dropdown label -> Kind (current group)
 
-        bar = self.kind_box.master
+        bar = self._filter_bar
         # A "Group" (API group) filter to the LEFT of the existing Type dropdown.
         # Picking a group narrows the Type list to that group's kinds and offers
         # an "(all kinds)" aggregate view of everything the group deploys.
-        first = bar.winfo_children()[0]       # the existing "Type:" label
         self.group_lbl = ttk.Label(bar, text="Group:")
         self.group_var = tk.StringVar(value=_ALL_GROUPS)
         self.group_box = ttk.Combobox(bar, textvariable=self.group_var, width=26,
                                       state="readonly", values=[_ALL_GROUPS])
-        self.group_lbl.pack(side="left", before=first)
-        self.group_box.pack(side="left", padx=4, before=first)
+        bar.insert(0, self.group_lbl)                 # ahead of the "Type:"/Kind label
+        bar.insert(1, self.group_box, padx=4)
         self.group_box.bind("<<ComboboxSelected>>", lambda e: self._on_group_change())
         # The base's "Type:" label now reads "Kind:" — it selects the kind/CR.
-        first.config(text="Kind:")
+        self._type_label.config(text="Kind:")
 
         # Add a "Reload CRDs" button into the existing Type/Namespace bar row.
-        ttk.Button(bar, text="⟳ Reload CRDs",
-                   command=self._discover).pack(side="left", padx=(2, 8))
+        bar.add(ttk.Button(bar, text="⟳ Reload CRDs", command=self._discover),
+                padx=(2, 8))
         self.status.config(text="Discovering CRDs…")
         self.after(150, self._poll_crds)
         self._discover()
