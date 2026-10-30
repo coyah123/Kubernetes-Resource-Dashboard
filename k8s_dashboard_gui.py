@@ -566,12 +566,25 @@ def build_model_from_raw(raw: dict) -> dict:
     node_rows = [build_node_row(n, node_usage.get(n["metadata"]["name"], (None, None)))
                  for n in nodes.get("items", [])]
 
+    # Per-node pod aggregates, computed once here from the FULL pod list so the
+    # Nodes table never depends on self.model["pods"], which other tabs replace
+    # with namespace-scoped subsets (that scoping used to undercount pods/node).
+    node_agg = {}
+
     pod_rows = []
     dep_usage = {}  # (ns, deployment) -> [cpu_m, mem_b] summed actual usage of its pods
     for p in pods.get("items", []):
         ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
         row = build_pod_row(p, pod_usage.get((ns, name), (None, None)))
         pod_rows.append(row)
+        a = node_agg.setdefault(
+            row["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
+        a["pods"] += 1
+        a["cpu"] += row["cpu_req_m"]
+        a["mem"] += row["mem_req_b"]
+        # host-network pods share the node's own IP, not a distinct pod IP.
+        if not row.get("host_network"):
+            a["ips"] += 1
         # Attribute this pod's usage to a Deployment (via its ReplicaSet owner).
         refs = p["metadata"].get("ownerReferences", [])
         dep_name = next((rs_to_dep.get((ns, o["name"])) for o in refs
@@ -584,6 +597,16 @@ def build_model_from_raw(raw: dict) -> dict:
     dep_rows = [build_dep_row(d, dep_usage.get(
         (d["metadata"]["namespace"], d["metadata"]["name"])))
         for d in deployments.get("items", [])]
+
+    # Attach the per-node pod aggregates so the Nodes table reads them straight
+    # off the node row instead of re-summing the (mutable, possibly-scoped) pods.
+    empty = {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0}
+    for n in node_rows:
+        a = node_agg.get(n["node"], empty)
+        n["agg_pods"] = a["pods"]
+        n["agg_cpu_m"] = a["cpu"]
+        n["agg_mem_b"] = a["mem"]
+        n["agg_ips"] = a["ips"]
 
     return {"nodes": node_rows, "pods": pod_rows, "deployments": dep_rows}
 
@@ -2027,20 +2050,14 @@ class Dashboard(tk.Tk):
                 pool_filter.set("All pools")
             selected = pool_filter.get()
 
-            # aggregate pod requests per node (from the current pod model)
-            agg = {}
-            for p in self.model["pods"]:
-                a = agg.setdefault(p["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
-                a["pods"] += 1
-                a["cpu"] += p["cpu_req_m"]
-                a["mem"] += p["mem_req_b"]
-                # host-network pods share the node's own IP, not a distinct pod IP.
-                if not p.get("host_network"):
-                    a["ips"] += 1
+            # Per-node pod aggregates are precomputed at model-build time from the
+            # FULL pod list (see build_model_from_raw); read them off the node row
+            # so a namespace-scoped Pods-tab refresh can't undercount pods/node.
             for n in self.model["nodes"]:
                 if selected != "All pools" and n["pool"] != selected:
                     continue
-                a = agg.get(n["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
+                a = {"pods": n.get("agg_pods", 0), "cpu": n.get("agg_cpu_m", 0.0),
+                     "mem": n.get("agg_mem_b", 0.0), "ips": n.get("agg_ips", 0)}
                 req_cpu_p = a["cpu"] / n["cpu_alloc_m"] * 100 if n["cpu_alloc_m"] else 0
                 req_mem_p = a["mem"] / n["mem_alloc_b"] * 100 if n["mem_alloc_b"] else 0
                 # Pod-IP capacity: k8s has no "IPs remaining" field, so we use
@@ -4273,12 +4290,18 @@ class ResourceDetailView(ttk.Frame):
         self._rpods_status = ttk.Label(bar, text="")
         ttk.Button(bar, text="⟳ Refresh",
                    command=self._load_resource_pods).pack(side="left")
+        ttk.Button(bar, text="🗑 Delete selected",
+                   command=self._delete_selected_pods).pack(side="left", padx=6)
+        self._rpods_force = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="force (--grace-period=0)",
+                        variable=self._rpods_force).pack(side="left")
         self._rpods_status.pack(side="left", padx=8)
 
         cols = ("namespace", "pod", "ready", "phase", "restarts", "node", "age")
         wrap = ttk.Frame(frame)
         wrap.pack(fill="both", expand=True)
-        tree = ttk.Treeview(wrap, columns=cols, show="headings")
+        # extended = Ctrl/Shift-click to multi-select pods for deletion.
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", selectmode="extended")
         vs = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vs.set)
         for c, w in zip(cols, [110, 300, 60, 90, 70, 150, 70]):
@@ -4289,7 +4312,8 @@ class ResourceDetailView(ttk.Frame):
         tree.bind("<Double-1>", lambda e: self._open_child_pod(tree))
         self._rpods_tree = tree
         ttk.Label(frame, padding=4,
-                  text="Double-click a pod to open it.").pack(anchor="w")
+                  text="Double-click a pod to open it · select one or more "
+                       "(Ctrl/Shift-click) and use Delete selected.").pack(anchor="w")
 
         self._load_resource_pods()
         self._after_ids.append(self.after(150, self._poll_resource_pods))
@@ -4312,6 +4336,18 @@ class ResourceDetailView(ttk.Frame):
         try:
             while True:
                 status, payload = self._pods_q.get_nowait()
+                if status == "deleted":
+                    n, errors = payload
+                    if errors:
+                        self._rpods_status.config(
+                            text=f"⚠ {len(errors)} of {n} failed")
+                        messagebox.showerror(
+                            "Delete pods", "Some deletions failed:\n\n"
+                            + "\n".join(errors))
+                    else:
+                        self._rpods_status.config(text=f"✓ deleted {n} pod(s)")
+                    self._load_resource_pods()  # refresh the now-changed list
+                    continue
                 tree = self._rpods_tree
                 for r in tree.get_children(""):
                     tree.delete(r)
@@ -4334,6 +4370,41 @@ class ResourceDetailView(ttk.Frame):
             return
         name, ns = self._rpods_rows[iid]
         ResourceDetailWindow(self, "pods", name, ns, self.context)
+
+    def _delete_selected_pods(self):
+        """Delete every pod currently selected in the Pods tab (confirmed first)."""
+        tree = self._rpods_tree
+        targets = [self._rpods_rows[iid] for iid in tree.selection()
+                   if iid in self._rpods_rows]
+        if not targets:
+            messagebox.showinfo(
+                "Delete pods", "Select one or more pods first "
+                "(click, or Ctrl/Shift-click for several).")
+            return
+        force = self._rpods_force.get()
+        names = "\n".join(f"  • {ns}/{name}" for name, ns in targets)
+        if not messagebox.askyesno(
+                "Delete pods",
+                f"Delete {len(targets)} pod(s)?"
+                + ("  (force, --grace-period=0)" if force else "")
+                + f"\n\n{names}\n\n"
+                "Controller-owned pods (Deployments/DaemonSets/etc.) will be "
+                "recreated — this reschedules them."):
+            return
+
+        self._rpods_status.config(text=f"⏳ deleting {len(targets)} pod(s)…")
+
+        def work():
+            errors = []
+            for name, ns in targets:
+                try:
+                    kubectl_collect.delete_pod(
+                        name, namespace=ns, context=self.context, force=force)
+                except Exception as e:  # noqa: BLE001 — collected, surfaced below
+                    errors.append(f"{ns}/{name}: {e}")
+            self._pods_q.put(("deleted", (len(targets), errors)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # -- embedded shell (kubectl exec -i) ----------------------------------
     def _build_exec_tab(self, nb, shell):

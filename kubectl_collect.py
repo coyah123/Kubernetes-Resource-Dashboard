@@ -217,11 +217,16 @@ def create_debug_pod(name: str, image: str, *, namespace: str = "", context: str
 
 
 def delete_pod(name: str, *, namespace: str = "", context: str = "",
-               timeout: int = 60) -> str:
-    """`kubectl delete pod <name>` (optionally namespaced). Raises on failure."""
+               force: bool = False, timeout: int = 60) -> str:
+    """`kubectl delete pod <name>` (optionally namespaced). Raises on failure.
+
+    force=True adds `--force --grace-period=0` to evict a pod stuck Terminating
+    (e.g. on a dead node) — skips the graceful shutdown, so use it deliberately."""
     args = ["delete", "pod", name]
     if namespace:
         args += ["-n", namespace]
+    if force:
+        args += ["--force", "--grace-period=0"]
     return _run(args, context=context, timeout=timeout)
 
 
