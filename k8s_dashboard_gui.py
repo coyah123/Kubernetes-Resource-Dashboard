@@ -1523,8 +1523,8 @@ class Dashboard(tk.Tk):
             tree.column(c, width=(widths[i] if widths else 120), anchor="w")
         tree.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        tree.tag_configure("crit", background="#5a1e1e")   # red — failing
-        tree.tag_configure("warn", background="#5a4a1e")   # amber — heads-up
+        tree.tag_configure("crit", background="#5a1e1e", foreground="white")   # red — failing
+        tree.tag_configure("warn", background="#5a4a1e", foreground="white")   # amber — heads-up
 
         # Visible CSV + XLSX buttons, plus a right-click export menu. Both export
         # exactly the rows currently on screen (current filter + sort order).
@@ -2745,8 +2745,8 @@ class Dashboard(tk.Tk):
         for c, w in zip(app_cols, (110, 200, 100, 100)):
             apps.heading(c, text=c)
             apps.column(c, width=w, anchor="w")
-        apps.tag_configure("crit", background="#5a1e1e")
-        apps.tag_configure("warn", background="#5a4a1e")
+        apps.tag_configure("crit", background="#5a1e1e", foreground="white")
+        apps.tag_configure("warn", background="#5a4a1e", foreground="white")
         apps.pack(side="left", fill="both", expand=True)
         avs.pack(side="right", fill="y")
         self._wire_cmd_preview(apps, "applications.argoproj.io",
@@ -2784,8 +2784,8 @@ class Dashboard(tk.Tk):
         for c, w in zip(list_cols, (110, 110, 150)):
             listview.heading(c, text=c)
             listview.column(c, width=w, anchor="w")
-        listview.tag_configure("crit", background="#5a1e1e")
-        listview.tag_configure("warn", background="#5a4a1e")
+        listview.tag_configure("crit", background="#5a1e1e", foreground="white")
+        listview.tag_configure("warn", background="#5a4a1e", foreground="white")
         listview.pack(side="left", fill="both", expand=True)
         lvs.pack(side="right", fill="y")
 
@@ -5492,8 +5492,8 @@ class ResourceBrowser(ttk.Frame):
         self._tree = tree
         # Shared red/amber row palette (matches _make_tree). Only rows a Kind's
         # severity fn flags get tagged — e.g. VolumeAttachments with an attachError.
-        tree.tag_configure("crit", background="#5a1e1e")   # red — failing
-        tree.tag_configure("warn", background="#5a4a1e")   # amber — heads-up
+        tree.tag_configure("crit", background="#5a1e1e", foreground="white")   # red — failing
+        tree.tag_configure("warn", background="#5a4a1e", foreground="white")   # amber — heads-up
 
         for it in sorted(items, key=lambda x: _meta(x).get("name", "")):
             ns = _meta(it).get("namespace", "")
