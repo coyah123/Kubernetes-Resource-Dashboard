@@ -295,7 +295,11 @@ access proxy.
 
 All actions run the same guarded `kubectl scale` / `kubectl rollout restart` /
 `kubectl delete` the rest of the app uses, on a background thread, each behind a
-confirmation. Click **⟳ Refresh applications** afterward to redraw with the result.
+confirmation. Afterward redraw with the result using one of the two refreshes:
+**⟳ Refresh applications** re-pulls every Application, while **⟳ Refresh selected
+app** re-fetches *only* the currently-selected Application plus the
+ReplicaSets/Pods in the namespaces it touches, and redraws just that app's tree —
+so you can update one app without re-listing the whole cluster.
 
 **How the tree is built.** The top level is exact — `Application.status.resources`
 is the set of resources Argo directly manages, stored right on the object. The

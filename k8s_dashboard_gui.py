@@ -2717,6 +2717,8 @@ class Dashboard(tk.Tk):
         status = ttk.Label(bar, text="")
         ttk.Button(bar, text="⟳ Refresh applications",
                    command=lambda: do_refresh()).pack(side="left")
+        ttk.Button(bar, text="⟳ Refresh selected app",
+                   command=lambda: refresh_selected_app()).pack(side="left", padx=4)
 
         ttk.Label(bar, text="View:").pack(side="left", padx=(12, 2))
         view_mode = tk.StringVar(value="Map")
@@ -3215,6 +3217,53 @@ class Dashboard(tk.Tk):
             else:
                 status.config(text="No Argo Applications found "
                                    "(is Argo CD installed on this cluster?)")
+
+        def refresh_selected_app():
+            """Re-fetch ONLY the selected Application and the ReplicaSets/Pods in
+            the namespaces it touches, then redraw just that app's tree — instead
+            of re-pulling every application in the cluster."""
+            iid = apps.focus()
+            app = self._argo_apps.get(iid)
+            if not app:
+                status.config(text="Select an application first")
+                return
+            meta = app.get("metadata", {})
+            name, app_ns = meta.get("name", ""), meta.get("namespace", "")
+
+            def _ns_items(ktype, ns):
+                try:
+                    return kubectl_collect.list_items(ktype, namespace=ns, context=ctx())
+                except Exception:        # noqa: BLE001 — treat as empty
+                    return []
+
+            def fetch():
+                fresh = kubectl_collect.get_item(
+                    "applications.argoproj.io", name, namespace=app_ns, context=ctx())
+                nss = {app_ns} | {r.get("namespace") for r in
+                                  (fresh.get("status", {}).get("resources", []) or [])
+                                  if r.get("namespace")}
+                rs, pods = [], []
+                for ns in nss:
+                    rs += _ns_items("rs", ns)
+                    pods += _ns_items("pods", ns)
+                return (fresh, nss, rs, pods)
+
+            def apply(data):
+                fresh, nss, rs, pods = data
+                self._argo_apps[iid] = fresh
+                st = fresh.get("status", {})
+                sync_s = st.get("sync", {}).get("status", "")
+                health_s = st.get("health", {}).get("status", "")
+                apps.item(iid, values=(app_ns, name, sync_s, health_s),
+                          tags=health_tag(sync_s, health_s))
+                # Swap in the freshly-listed rs/pods for just those namespaces.
+                self._argo_rs = [o for o in getattr(self, "_argo_rs", [])
+                                 if o.get("metadata", {}).get("namespace") not in nss] + rs
+                self._argo_pods = [o for o in getattr(self, "_argo_pods", [])
+                                   if o.get("metadata", {}).get("namespace") not in nss] + pods
+                show_app()   # rebuild + redraw the current app's tree
+
+            self._scoped_refresh(fetch, apply, status)
 
         def do_refresh():
             def fetch():
