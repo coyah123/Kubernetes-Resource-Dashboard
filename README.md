@@ -279,11 +279,23 @@ access proxy.
     colored by sync/health. Scroll with the mouse wheel (Shift = horizontal).
   - **List** — the exact same tree as an indented, collapsible table (resource /
     sync / health / namespace).
-- **Inspect / edit** — in either view, **double-click** a resource (or
-  **right-click → View / edit YAML…**) to open the standard Describe / YAML /
-  Events detail window, including the **✎ Edit** action (in-app YAML apply or
-  external `kubectl edit`). A single click previews the resource's
+- **Inspect / act (Map)** — **single-click** any box to open it in an inline
+  panel on the right of the map (like Argo's slide-out): a title, **Scale… /
+  Rollout restart / Delete…** buttons, and the full Describe / YAML / Events /
+  **✎ Edit** view embedded. The action buttons enable by kind — **Scale** for
+  Deployment / StatefulSet / ReplicaSet / ReplicationController, **Rollout
+  restart** for Deployment / StatefulSet / DaemonSet, **Delete** for anything —
+  and each asks for confirmation first. **Double-click** still opens the resource
+  in a separate window; **right-click** gives a View / edit · Copy-command menu.
+- **Bulk act (List)** — the List view has **☑** and **⧉** columns: tick several
+  rows and use **Rollout restart** or **Delete…** at the bottom to act on them all
+  at once (restart auto-filters to the workloads that support it). ⧉ or
+  double-click opens a resource; selecting one previews its
   `kubectl get … -o yaml` in the bottom command bar.
+
+All actions run the same guarded `kubectl scale` / `kubectl rollout restart` /
+`kubectl delete` the rest of the app uses, on a background thread, each behind a
+confirmation. Click **⟳ Refresh applications** afterward to redraw with the result.
 
 **How the tree is built.** The top level is exact — `Application.status.resources`
 is the set of resources Argo directly manages, stored right on the object. The

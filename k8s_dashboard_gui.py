@@ -2758,31 +2758,160 @@ class Dashboard(tk.Tk):
         right = ttk.Frame(panes)
         panes.add(right, weight=3)
 
-        # --- Map view: a scrollable canvas of boxes joined by lines.
+        # Which kinds support which action (by the kind name Argo reports).
+        SCALABLE = {"Deployment", "StatefulSet", "ReplicaSet", "ReplicationController"}
+        RESTARTABLE = {"Deployment", "StatefulSet", "DaemonSet"}
+
+        def is_restartable(ktype):
+            return ktype.split(".")[0] in {"deployment", "statefulset", "daemonset"}
+
+        # --- Map view: a canvas of boxes on the left, an inline detail + action
+        # panel on the right (like Argo's slide-out) that opens on single-click.
         graph_wrap = ttk.Frame(right)
-        canvas = tk.Canvas(graph_wrap, background="#1e1e1e", highlightthickness=0)
-        cvs = ttk.Scrollbar(graph_wrap, orient="vertical", command=canvas.yview)
-        chs = ttk.Scrollbar(graph_wrap, orient="horizontal", command=canvas.xview)
+        gpanes = ttk.PanedWindow(graph_wrap, orient="horizontal")
+        gpanes.pack(fill="both", expand=True)
+
+        canvas_frame = ttk.Frame(gpanes)
+        gpanes.add(canvas_frame, weight=3)
+        canvas = tk.Canvas(canvas_frame, background="#1e1e1e", highlightthickness=0)
+        cvs = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+        chs = ttk.Scrollbar(canvas_frame, orient="horizontal", command=canvas.xview)
         canvas.configure(yscrollcommand=cvs.set, xscrollcommand=chs.set)
         chs.pack(side="bottom", fill="x")
         cvs.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        # Scroll with the mouse wheel (vertical; shift = horizontal).
         canvas.bind("<MouseWheel>",
                     lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
         canvas.bind("<Shift-MouseWheel>",
                     lambda e: canvas.xview_scroll(int(-e.delta / 120), "units"))
 
-        # --- List view: the same tree as an indented, collapsible table.
+        # Inline detail panel: title + action buttons + an embedded detail view.
+        panel = ttk.Frame(gpanes)
+        gpanes.add(panel, weight=2)
+        pbar = WrapBar(panel, padding=4)
+        pbar.pack(fill="x")
+        panel_title = ttk.Label(pbar, text="Click a resource to inspect / act on it",
+                                font=("", 9, "bold"))
+        pbar.add(panel_title)
+        pact = WrapBar(panel, padding=(4, 0, 4, 4))
+        pact.pack(fill="x")
+        pscale = ttk.Button(pact, text="Scale…", command=lambda: panel_scale())
+        prestart = ttk.Button(pact, text="Rollout restart",
+                              command=lambda: panel_restart())
+        pdelete = ttk.Button(pact, text="Delete…", command=lambda: panel_delete())
+        pact.add(pscale)
+        pact.add(prestart, padx=4)
+        pact.add(pdelete)
+        pstatus = ttk.Label(pact, text="")
+        pact.add(pstatus, padx=8)
+        for b in (pscale, prestart, pdelete):
+            b.state(["disabled"])
+        panel_body = ttk.Frame(panel)
+        panel_body.pack(fill="both", expand=True)
+        panel_detail = {"d": None}       # the embedded ResourceDetailView, if any
+        panel_target = {"t": None, "kind": ""}
+
+        def clear_panel_detail():
+            d = panel_detail["d"]
+            if d is not None:
+                try:
+                    d.teardown()
+                    d.destroy()
+                except Exception:        # noqa: BLE001 — best-effort teardown
+                    pass
+                panel_detail["d"] = None
+
+        def show_in_panel(ktype, name, ns, kind):
+            panel_target["t"] = (ktype, name, ns)
+            panel_target["kind"] = kind
+            panel_title.config(text=f"{kind}/{name}" + (f"  ·  {ns}" if ns else ""))
+            pscale.state(["!disabled"] if kind in SCALABLE else ["disabled"])
+            prestart.state(["!disabled"] if kind in RESTARTABLE else ["disabled"])
+            pdelete.state(["!disabled"] if name else ["disabled"])
+            pstatus.config(text="")
+            clear_panel_detail()
+            if name:
+                d = ResourceDetailView(panel_body, ktype, name, ns, ctx())
+                d.pack(fill="both", expand=True)
+                panel_detail["d"] = d
+
+        def panel_scale():
+            tgt = panel_target["t"]
+            if not tgt or not tgt[1]:
+                return
+            ktype, name, ns = tgt
+            n = simpledialog.askinteger(
+                "Scale", f"Replicas for {panel_target['kind']}/{name}:",
+                parent=self, minvalue=0)
+            if n is None:
+                return
+            self._run_bulk(
+                [("", ktype, name, ns)],
+                lambda kt, nm, s: kubectl_collect.scale(
+                    kt, nm, n, namespace=s, context=ctx()), "Scaled", pstatus)
+
+        def panel_restart():
+            tgt = panel_target["t"]
+            if not tgt or not tgt[1]:
+                return
+            ktype, name, ns = tgt
+            if not messagebox.askyesno(
+                    "Rollout restart", f"Rolling-restart {panel_target['kind']}/{name}?"):
+                return
+            self._run_bulk(
+                [("", ktype, name, ns)],
+                lambda kt, nm, s: kubectl_collect.rollout_restart(
+                    kt, nm, namespace=s, context=ctx()), "Restarted", pstatus)
+
+        def panel_delete():
+            tgt = panel_target["t"]
+            if not tgt or not tgt[1]:
+                return
+            ktype, name, ns = tgt
+            if not messagebox.askyesno(
+                    "Delete", f"Delete {panel_target['kind']}/{name}?\n\n"
+                    "This cannot be undone.", icon="warning"):
+                return
+            self._run_bulk(
+                [("", ktype, name, ns)],
+                lambda kt, nm, s: kubectl_collect.delete(
+                    kt, nm, namespace=s, context=ctx()), "Deleted", pstatus)
+            clear_panel_detail()
+            panel_title.config(text="Deleted — ⟳ Refresh to update the map")
+            for b in (pscale, prestart, pdelete):
+                b.state(["disabled"])
+
+        # --- List view: the same tree with ☑ checkboxes + bulk restart/delete.
         list_wrap = ttk.Frame(right)
-        list_cols = ("sync", "health", "namespace")
-        listview = ttk.Treeview(list_wrap, columns=list_cols, show="tree headings")
-        lvs = ttk.Scrollbar(list_wrap, orient="vertical", command=listview.yview)
+        lbar = ttk.Frame(list_wrap, padding=(4, 2))
+        lbar.pack(side="bottom", fill="x")
+        ttk.Button(lbar, text="Rollout restart",
+                   command=lambda: list_restart()).pack(side="left")
+        ttk.Button(lbar, text="Delete…",
+                   command=lambda: list_delete()).pack(side="left", padx=4)
+        lstatus = ttk.Label(lbar, text="")
+        lstatus.pack(side="left", padx=8)
+        ttk.Label(list_wrap, padding=(4, 0), text=(
+            "Tick ☑ to select several (or act on the focused row); click ⧉ or "
+            "double-click to open. Rollout restart applies to Deployment / "
+            "StatefulSet / DaemonSet only.")).pack(side="bottom", anchor="w")
+
+        list_area = ttk.Frame(list_wrap)
+        list_area.pack(side="top", fill="both", expand=True)
+        list_cols = ("sel", "open", "sync", "health", "namespace")
+        listview = ttk.Treeview(list_area, columns=list_cols, show="tree headings")
+        lvs = ttk.Scrollbar(list_area, orient="vertical", command=listview.yview)
         listview.configure(yscrollcommand=lvs.set)
         listview.heading("#0", text="resource")
-        listview.column("#0", width=340, anchor="w")
-        for c, w in zip(list_cols, (110, 110, 150)):
-            listview.heading(c, text=c)
+        listview.column("#0", width=300, anchor="w")
+        listview.heading("sel", text="☑")
+        listview.heading("open", text="⧉")
+        listview.heading("sync", text="sync")
+        listview.heading("health", text="health")
+        listview.heading("namespace", text="namespace")
+        listview.column("sel", width=34, anchor="center", stretch=False)
+        listview.column("open", width=36, anchor="center", stretch=False)
+        for c, w in zip(("sync", "health", "namespace"), (100, 100, 140)):
             listview.column(c, width=w, anchor="w")
         listview.tag_configure("crit", background="#5a1e1e", foreground="white")
         listview.tag_configure("warn", background="#5a4a1e", foreground="white")
@@ -2920,8 +3049,12 @@ class Dashboard(tk.Tk):
                                font=("TkDefaultFont", 8), tags=(tag,))
             target = (node["ktype"], node["name"], node["ns"])
             node_targets[tag] = target
+
+            def on_click(_e, t=target, k=node["kind"]):
+                preview_target(*t)
+                show_in_panel(t[0], t[1], t[2], k)
+            canvas.tag_bind(tag, "<Button-1>", on_click)
             canvas.tag_bind(tag, "<Double-1>", lambda _e, t=target: open_target(*t))
-            canvas.tag_bind(tag, "<Button-1>", lambda _e, t=target: preview_target(*t))
             canvas.tag_bind(tag, "<Button-3>", lambda e, t=target: popup_menu(e, t))
 
         def render_map(root):
@@ -2934,6 +3067,7 @@ class Dashboard(tk.Tk):
                 canvas.configure(scrollregion=(0, 0, bbox[2] + 20, bbox[3] + 20))
 
         def render_list(root):
+            ms_list.reset()
             for r in listview.get_children(""):
                 listview.delete(r)
             list_targets.clear()
@@ -2942,7 +3076,7 @@ class Dashboard(tk.Tk):
                 iid = listview.insert(
                     parent, "end", open=True,
                     text=f"{node['kind']}/{node['name']}",
-                    values=(node["sync"], node["health"], node["ns"]),
+                    values=("☐", "⧉", node["sync"], node["health"], node["ns"]),
                     tags=health_tag(node["sync"], node["health"]))
                 list_targets[iid] = (node["ktype"], node["name"], node["ns"])
                 for c in node["children"]:
@@ -2987,19 +3121,67 @@ class Dashboard(tk.Tk):
             current_root["node"] = root
             (render_list if view_mode.get() == "List" else render_map)(root)
 
-        # Open / preview / right-click also work in the List view.
-        listview.bind("<Double-1>",
-                      lambda _e: open_target(*list_targets.get(listview.focus(),
-                                                               ("", "", ""))))
+        # List view: ☑ checkbox select + ⧉/double-click to open (via MultiSelect),
+        # plus command preview on select and a right-click menu.
+        ms_list = MultiSelect(
+            listview,
+            lambda row: open_target(*list_targets.get(row, ("", "", ""))),
+            lambda row: open_target(*list_targets.get(row, ("", "", ""))))
         listview.bind("<<TreeviewSelect>>",
                       lambda _e: preview_target(*list_targets.get(listview.focus(),
-                                                                  ("", "", ""))))
+                                                                  ("", "", ""))), add="+")
         listview.bind(
             "<Button-3>",
             lambda e: popup_menu(e, list_targets.get(
                 listview.identify_row(e.y), ("", "", ""))))
 
-        apps.bind("<<TreeviewSelect>>", show_app, add="+")
+        def list_checked():
+            """Checked rows (or the focused one) as (iid, ktype, name, ns)."""
+            return [(i,) + list_targets[i]
+                    for i in ms_list.targets() if i in list_targets]
+
+        def list_restart():
+            items = [t for t in list_checked() if is_restartable(t[1])]
+            if not items:
+                messagebox.showinfo(
+                    "Rollout restart", "Tick one or more Deployment / StatefulSet "
+                    "/ DaemonSet rows first.")
+                return
+            if not messagebox.askyesno(
+                    "Rollout restart", f"Rolling-restart {len(items)} workload(s)?"):
+                return
+            self._run_bulk(items, lambda kt, n, ns: kubectl_collect.rollout_restart(
+                kt, n, namespace=ns, context=ctx()), "Restarted", lstatus)
+
+        def list_delete():
+            items = list_checked()
+            if not items:
+                messagebox.showinfo("Delete", "Tick one or more rows first.")
+                return
+            names = ", ".join(n for _, _, n, _ in items[:5]) + (
+                "…" if len(items) > 5 else "")
+            if not messagebox.askyesno(
+                    "Delete", f"Delete {len(items)} resource(s)?\n\n{names}\n\n"
+                    "This cannot be undone.", icon="warning"):
+                return
+            self._run_bulk(items, lambda kt, n, ns: kubectl_collect.delete(
+                kt, n, namespace=ns, context=ctx()), "Deleted", lstatus,
+                tree=listview, remove_on_success=True)
+
+        def reset_panel():
+            clear_panel_detail()
+            panel_target["t"] = None
+            panel_title.config(text="Click a resource to inspect / act on it")
+            for b in (pscale, prestart, pdelete):
+                b.state(["disabled"])
+            pstatus.config(text="")
+
+        _orig_show_app = show_app
+
+        def show_app_wrapped(_e=None):
+            reset_panel()
+            _orig_show_app()
+        apps.bind("<<TreeviewSelect>>", show_app_wrapped, add="+")
         switch_view()   # pack the default (Map) view
 
         def refill(data):
@@ -3009,6 +3191,7 @@ class Dashboard(tk.Tk):
             canvas.delete("all")
             node_targets.clear()
             current_root["node"] = None
+            reset_panel()
             for r in listview.get_children(""):
                 listview.delete(r)
             list_targets.clear()
