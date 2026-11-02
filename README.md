@@ -112,6 +112,20 @@ folder" to cache a snapshot you can reopen later (offline / air-gapped).
   lets you browse instances of any of them, using each CRD's own
   `additionalPrinterColumns` so you see its author-defined state. A **⟳ Reload
   CRDs** button re-discovers after installing/removing an operator.
+- **Argo CD** — lists every Argo `Application` in the cluster and draws the
+  **resource tree each one deploys**, the way Argo's own UI does: boxes joined by
+  lines, **Application → Deployment → ReplicaSet → Pods** (plus Services, Ingress,
+  ConfigMaps, …), colored by sync + health (green healthy / amber in-flight / red
+  OutOfSync or Degraded). It's rendered from a **snapshot**, not a live Argo
+  connection — the top level comes from `Application.status.resources` and the
+  deeper children (ReplicaSets, the actual Pods a Deployment runs) are
+  reconstructed by walking `ownerReferences` across a `kubectl get rs,pods -A`
+  snapshot, exactly how Argo derives them. A **View: Map / List** toggle switches
+  between the drawn graph (default) and the same tree as an indented, collapsible
+  table. **Double-click** any resource (or **right-click → View / edit YAML…**) to
+  open the usual Describe / YAML / Events detail view with the ✎ Edit action; a
+  single click previews its `kubectl get … -o yaml` in the command bar. See
+  **Argo CD tab** below.
 - **Resource Management** — pods reserving far more memory than they actually use
 - **Trends** — record resource use over time and graph it (see below)
 
@@ -245,6 +259,48 @@ first, then reloads the list:
 
 There is no create/edit-and-apply or deploy wizard — this stays a read-mostly tool
 with a few common, guarded actions.
+
+### Argo CD tab
+
+Shows what Argo CD shows — each `Application` and the tree of resources it
+deploys — but **from a snapshot, not a live Argo connection**. No Argo API
+server, no `argocd` CLI, no Argo auth: everything is derived from plain,
+read-only `kubectl`, so it works even when the Argo API/UI is gated behind an
+access proxy.
+
+- **Left pane** — every Argo `Application` across all namespaces, with its sync
+  and health. Red = OutOfSync / Degraded / Missing; amber = Progressing /
+  Suspended / Unknown.
+- **Right pane** — select an Application to see its resource tree. Two views via
+  the **View: Map / List** toggle (default **Map**):
+  - **Map** — an Argo-style diagram: boxes joined by lines, laid out
+    left-to-right **Application → Deployment → ReplicaSet → Pods**, with Services,
+    Ingress, ConfigMaps and the rest hanging off the Application. Boxes are
+    colored by sync/health. Scroll with the mouse wheel (Shift = horizontal).
+  - **List** — the exact same tree as an indented, collapsible table (resource /
+    sync / health / namespace).
+- **Inspect / edit** — in either view, **double-click** a resource (or
+  **right-click → View / edit YAML…**) to open the standard Describe / YAML /
+  Events detail window, including the **✎ Edit** action (in-app YAML apply or
+  external `kubectl edit`). A single click previews the resource's
+  `kubectl get … -o yaml` in the bottom command bar.
+
+**How the tree is built.** The top level is exact — `Application.status.resources`
+is the set of resources Argo directly manages, stored right on the object. The
+*deeper* children aren't on the Application object (Argo computes them live by
+walking ownership), so the tab reconstructs them the same way, from the snapshot:
+
+```bash
+kubectl get applications.argoproj.io -A -o json   # the Applications + their status.resources
+kubectl get rs -A -o json                         # ReplicaSets, joined to Deployments by ownerReferences
+kubectl get pods -A -o json                        # Pods, joined to their ReplicaSet/StatefulSet/DaemonSet
+```
+
+Each Pod/ReplicaSet is attached under the parent named in its
+`metadata.ownerReferences`, so the Pods you see under a Deployment are the actual
+Pods that Deployment is running right now in the snapshot. (Pod health in the
+graph is derived from phase/container state the same way Argo shows it.) If Argo
+CD isn't installed, the first call simply returns nothing and the tab says so.
 
 ### Trends tab (capture over a day)
 

@@ -1476,6 +1476,7 @@ class Dashboard(tk.Tk):
         for group in RESOURCE_GROUPS:
             self._build_group_tab(group)
         self._build_crd_tab()
+        self._build_argocd_tab()
         # Keep the persistent Trends + Debugging tabs last (in that order).
         self.nb.insert("end", self._trends_frame)
         self.nb.insert("end", self._debug_frame)
@@ -2691,6 +2692,358 @@ class Dashboard(tk.Tk):
         browser = CustomResourceBrowser(
             frame, lambda: self.context_var.get().strip())
         browser.pack(fill="both", expand=True)
+
+    def _build_argocd_tab(self):
+        """Argo CD: list every Argo ``Application`` and draw each one's resource
+        tree the way Argo's UI does — boxes joined by lines, Application →
+        Deployment → ReplicaSet → Pods (plus Services, Ingress, ConfigMaps, …),
+        rendered from a snapshot, not a live Argo connection.
+
+        The top level comes from ``Application.status.resources`` (the set Argo
+        directly manages, stored on the object). The deeper children — the
+        ReplicaSets a Deployment spawns and the Pods under them — are
+        reconstructed exactly the way Argo computes them: by walking
+        ``ownerReferences`` across a ``kubectl get rs,pods -A`` snapshot. So the
+        graph shows the actual Pods each Deployment is running. Double-click any
+        box to open the usual Describe / YAML / Events (and ✎ Edit) view.
+        """
+        frame = ttk.Frame(self.nb)
+        self.nb.add(frame, text="Argo CD")
+        self._analysis_frames.append(frame)
+        ctx = lambda: self.context_var.get().strip()
+
+        bar = ttk.Frame(frame, padding=4)
+        bar.pack(fill="x")
+        status = ttk.Label(bar, text="")
+        ttk.Button(bar, text="⟳ Refresh applications",
+                   command=lambda: do_refresh()).pack(side="left")
+
+        ttk.Label(bar, text="View:").pack(side="left", padx=(12, 2))
+        view_mode = tk.StringVar(value="Map")
+        for label in ("Map", "List"):
+            ttk.Radiobutton(bar, text=label, value=label, variable=view_mode,
+                            command=lambda: switch_view()).pack(side="left")
+        status.pack(side="left", padx=8)
+
+        ttk.Label(frame, padding=(6, 0), text=(
+            "Argo Applications and the resource tree each one deploys "
+            "(Application → Deployment → ReplicaSet → Pods, plus Services, "
+            "Ingress, …). Double-click a resource to view / edit its YAML; "
+            "right-click for more.")
+        ).pack(anchor="w")
+
+        panes = ttk.PanedWindow(frame, orient="horizontal")
+        panes.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Left: the list of Applications.
+        left = ttk.Frame(panes)
+        panes.add(left, weight=1)
+        app_cols = ("namespace", "application", "sync", "health")
+        apps = ttk.Treeview(left, columns=app_cols, show="headings")
+        avs = ttk.Scrollbar(left, orient="vertical", command=apps.yview)
+        apps.configure(yscrollcommand=avs.set)
+        for c, w in zip(app_cols, (110, 200, 100, 100)):
+            apps.heading(c, text=c)
+            apps.column(c, width=w, anchor="w")
+        apps.tag_configure("crit", background="#5a1e1e")
+        apps.tag_configure("warn", background="#5a4a1e")
+        apps.pack(side="left", fill="both", expand=True)
+        avs.pack(side="right", fill="y")
+        self._wire_cmd_preview(apps, "applications.argoproj.io",
+                               "application", "namespace")
+
+        # Right: two interchangeable views of the selected app's tree — a drawn
+        # box "Map" (default) and a collapsible "List". Only one is packed at a
+        # time (switch_view toggles them).
+        right = ttk.Frame(panes)
+        panes.add(right, weight=3)
+
+        # --- Map view: a scrollable canvas of boxes joined by lines.
+        graph_wrap = ttk.Frame(right)
+        canvas = tk.Canvas(graph_wrap, background="#1e1e1e", highlightthickness=0)
+        cvs = ttk.Scrollbar(graph_wrap, orient="vertical", command=canvas.yview)
+        chs = ttk.Scrollbar(graph_wrap, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=cvs.set, xscrollcommand=chs.set)
+        chs.pack(side="bottom", fill="x")
+        cvs.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        # Scroll with the mouse wheel (vertical; shift = horizontal).
+        canvas.bind("<MouseWheel>",
+                    lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+        canvas.bind("<Shift-MouseWheel>",
+                    lambda e: canvas.xview_scroll(int(-e.delta / 120), "units"))
+
+        # --- List view: the same tree as an indented, collapsible table.
+        list_wrap = ttk.Frame(right)
+        list_cols = ("sync", "health", "namespace")
+        listview = ttk.Treeview(list_wrap, columns=list_cols, show="tree headings")
+        lvs = ttk.Scrollbar(list_wrap, orient="vertical", command=listview.yview)
+        listview.configure(yscrollcommand=lvs.set)
+        listview.heading("#0", text="resource")
+        listview.column("#0", width=340, anchor="w")
+        for c, w in zip(list_cols, (110, 110, 150)):
+            listview.heading(c, text=c)
+            listview.column(c, width=w, anchor="w")
+        listview.tag_configure("crit", background="#5a1e1e")
+        listview.tag_configure("warn", background="#5a4a1e")
+        listview.pack(side="left", fill="both", expand=True)
+        lvs.pack(side="right", fill="y")
+
+        self._argo_apps = {}      # app iid -> Application object
+        node_targets = {}         # canvas tag -> (ktype, name, namespace)
+        list_targets = {}         # listview iid -> (ktype, name, namespace)
+        current_root = {"node": None}   # the tree built for the selected app
+
+        # Shared right-click menu: open (view/edit) the resource under the cursor.
+        menu_target = {"t": None}
+        ctx_menu = tk.Menu(frame, tearoff=0)
+
+        def open_target(ktype, name, ns):
+            if name:
+                ResourceDetailWindow(self, ktype, name, ns, ctx())
+
+        def preview_target(ktype, name, ns):
+            if name:
+                self.show_command(kubectl_collect.get_argv(
+                    ktype, name, namespace=ns, context=ctx()), source="selected")
+
+        ctx_menu.add_command(
+            label="View / edit YAML…",
+            command=lambda: menu_target["t"] and open_target(*menu_target["t"]))
+        ctx_menu.add_command(
+            label="Copy kubectl get command",
+            command=lambda: menu_target["t"] and preview_target(*menu_target["t"]))
+
+        def popup_menu(event, target):
+            if not target or not target[1]:
+                return
+            menu_target["t"] = target
+            ctx_menu.tk_popup(event.x_root, event.y_root)
+
+        def box_fill(sync_s, health_s):
+            """Argo-ish box color: red = bad, amber = in-flight, green = healthy."""
+            if sync_s == "OutOfSync" or health_s in ("Degraded", "Missing"):
+                return "#5a1e1e"
+            if health_s in ("Progressing", "Suspended", "Unknown"):
+                return "#5a4a1e"
+            if health_s == "Healthy":
+                return "#1e3a1e"
+            return "#2d2d2d"
+
+        def health_tag(sync_s, health_s):
+            if sync_s == "OutOfSync" or health_s in ("Degraded", "Missing"):
+                return ("crit",)
+            if health_s in ("Progressing", "Suspended", "Unknown"):
+                return ("warn",)
+            return ()
+
+        def pod_health(pod):
+            """Derive an Argo-style health word from a Pod's phase/containers."""
+            st = pod.get("status", {})
+            for cs in st.get("containerStatuses", []) or []:
+                w = (cs.get("state", {}) or {}).get("waiting")
+                if w and w.get("reason", "").endswith(("BackOff", "Error",
+                                                        "ImagePull")):
+                    return "Degraded"
+            phase = st.get("phase", "")
+            if phase in ("Running", "Succeeded"):
+                return "Healthy"
+            if phase == "Pending":
+                return "Progressing"
+            if phase == "Failed":
+                return "Degraded"
+            return phase or "Unknown"
+
+        def children_index():
+            """Map (ownerKindLower, ownerName, ns) -> [(kind, ktype, obj)] from
+            the ReplicaSet + Pod snapshot, so any node can look up what it owns."""
+            idx = {}
+            sources = ([("ReplicaSet", "replicaset.apps", o)
+                        for o in getattr(self, "_argo_rs", [])]
+                       + [("Pod", "pod", o)
+                          for o in getattr(self, "_argo_pods", [])])
+            for kind, ktype, obj in sources:
+                meta = obj.get("metadata", {})
+                ns = meta.get("namespace", "")
+                for ref in meta.get("ownerReferences", []) or []:
+                    key = (ref.get("kind", "").lower(), ref.get("name", ""), ns)
+                    idx.setdefault(key, []).append((kind, ktype, obj))
+            return idx
+
+        def make_node(kind, name, ns, ktype, sync, health, idx, depth=0):
+            node = {"kind": kind, "name": name, "ns": ns, "ktype": ktype,
+                    "sync": sync, "health": health, "children": []}
+            if depth < 6:  # guard against any pathological owner cycle
+                for ckind, cktype, cobj in idx.get((kind.lower(), name, ns), []):
+                    cmeta = cobj.get("metadata", {})
+                    chealth = pod_health(cobj) if ckind == "Pod" else ""
+                    node["children"].append(make_node(
+                        ckind, cmeta.get("name", ""), ns, cktype, "",
+                        chealth, idx, depth + 1))
+            return node
+
+        BW, BH, HGAP, VGAP = 180, 48, 80, 18
+
+        def layout(node, depth, row):
+            node["x"] = 12 + depth * (BW + HGAP)
+            if node["children"]:
+                for c in node["children"]:
+                    row = layout(c, depth + 1, row)
+                ys = [c["y"] for c in node["children"]]
+                node["y"] = (min(ys) + max(ys)) / 2
+                return row
+            node["y"] = 12 + row * (BH + VGAP)
+            return row + 1
+
+        def draw(node, n=[0]):
+            for c in node["children"]:
+                x1, y1 = node["x"] + BW, node["y"] + BH / 2
+                x2, y2 = c["x"], c["y"] + BH / 2
+                mid = (x1 + x2) / 2
+                canvas.create_line(x1, y1, mid, y1, mid, y2, x2, y2,
+                                   fill="#666", width=2)
+                draw(c)
+            tag = f"an{n[0]}"
+            n[0] += 1
+            fill = box_fill(node["sync"], node["health"])
+            canvas.create_rectangle(node["x"], node["y"], node["x"] + BW,
+                                    node["y"] + BH, fill=fill, outline="#888",
+                                    width=1, tags=(tag,))
+            canvas.create_text(node["x"] + 8, node["y"] + 12, anchor="w",
+                               text=node["kind"], fill="#9cdcfe",
+                               font=("TkDefaultFont", 8, "bold"), tags=(tag,))
+            label = node["name"]
+            if len(label) > 26:
+                label = label[:25] + "…"
+            canvas.create_text(node["x"] + 8, node["y"] + 30, anchor="w",
+                               text=label, fill="#ddd",
+                               font=("TkDefaultFont", 8), tags=(tag,))
+            target = (node["ktype"], node["name"], node["ns"])
+            node_targets[tag] = target
+            canvas.tag_bind(tag, "<Double-1>", lambda _e, t=target: open_target(*t))
+            canvas.tag_bind(tag, "<Button-1>", lambda _e, t=target: preview_target(*t))
+            canvas.tag_bind(tag, "<Button-3>", lambda e, t=target: popup_menu(e, t))
+
+        def render_map(root):
+            canvas.delete("all")
+            node_targets.clear()
+            layout(root, 0, 0)
+            draw(root)
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=(0, 0, bbox[2] + 20, bbox[3] + 20))
+
+        def render_list(root):
+            for r in listview.get_children(""):
+                listview.delete(r)
+            list_targets.clear()
+
+            def insert(node, parent):
+                iid = listview.insert(
+                    parent, "end", open=True,
+                    text=f"{node['kind']}/{node['name']}",
+                    values=(node["sync"], node["health"], node["ns"]),
+                    tags=health_tag(node["sync"], node["health"]))
+                list_targets[iid] = (node["ktype"], node["name"], node["ns"])
+                for c in node["children"]:
+                    insert(c, iid)
+            insert(root, "")
+
+        def switch_view():
+            graph_wrap.pack_forget()
+            list_wrap.pack_forget()
+            if view_mode.get() == "List":
+                list_wrap.pack(fill="both", expand=True)
+            else:
+                graph_wrap.pack(fill="both", expand=True)
+            if current_root["node"]:
+                (render_list if view_mode.get() == "List" else render_map)(
+                    current_root["node"])
+
+        def show_app(_e=None):
+            current_root["node"] = None
+            canvas.delete("all")
+            node_targets.clear()
+            app = self._argo_apps.get(apps.focus())
+            if not app:
+                return
+            meta = app.get("metadata", {})
+            st = app.get("status", {})
+            idx = children_index()
+            root = make_node(
+                "Application", meta.get("name", ""), meta.get("namespace", ""),
+                "applications.argoproj.io", st.get("sync", {}).get("status", ""),
+                st.get("health", {}).get("status", ""), idx)
+            # Build the whole tree first (top-level managed resources as the
+            # Application's children, each then expanded via ownerReferences).
+            for r in st.get("resources", []) or []:
+                kind, name = r.get("kind", ""), r.get("name", "")
+                ns = r.get("namespace", "") or meta.get("namespace", "")
+                group = r.get("group", "")
+                ktype = f"{kind.lower()}.{group}" if group else kind.lower()
+                root["children"].append(make_node(
+                    kind, name, ns, ktype, r.get("status", ""),
+                    (r.get("health") or {}).get("status", ""), idx))
+            current_root["node"] = root
+            (render_list if view_mode.get() == "List" else render_map)(root)
+
+        # Open / preview / right-click also work in the List view.
+        listview.bind("<Double-1>",
+                      lambda _e: open_target(*list_targets.get(listview.focus(),
+                                                               ("", "", ""))))
+        listview.bind("<<TreeviewSelect>>",
+                      lambda _e: preview_target(*list_targets.get(listview.focus(),
+                                                                  ("", "", ""))))
+        listview.bind(
+            "<Button-3>",
+            lambda e: popup_menu(e, list_targets.get(
+                listview.identify_row(e.y), ("", "", ""))))
+
+        apps.bind("<<TreeviewSelect>>", show_app, add="+")
+        switch_view()   # pack the default (Map) view
+
+        def refill(data):
+            for r in apps.get_children(""):
+                apps.delete(r)
+            self._argo_apps.clear()
+            canvas.delete("all")
+            node_targets.clear()
+            current_root["node"] = None
+            for r in listview.get_children(""):
+                listview.delete(r)
+            list_targets.clear()
+            self._argo_rs = data.get("rs", [])
+            self._argo_pods = data.get("pods", [])
+            items = sorted(data.get("apps", []), key=lambda a: (
+                a.get("metadata", {}).get("namespace", ""),
+                a.get("metadata", {}).get("name", "")))
+            for app in items:
+                meta = app.get("metadata", {})
+                st = app.get("status", {})
+                sync_s = st.get("sync", {}).get("status", "")
+                health_s = st.get("health", {}).get("status", "")
+                iid = apps.insert("", "end", values=(
+                    meta.get("namespace", ""), meta.get("name", ""),
+                    sync_s, health_s), tags=health_tag(sync_s, health_s))
+                self._argo_apps[iid] = app
+            if items:
+                status.config(text=f"{len(items)} application(s) — "
+                                   "select one to see its tree")
+            else:
+                status.config(text="No Argo Applications found "
+                                   "(is Argo CD installed on this cluster?)")
+
+        def do_refresh():
+            def fetch():
+                return {
+                    "apps": kubectl_collect.list_items_safe(
+                        "applications.argoproj.io", context=ctx()),
+                    "rs": kubectl_collect.list_items_safe("rs", context=ctx()),
+                    "pods": kubectl_collect.list_items_safe("pods", context=ctx()),
+                }
+            self._scoped_refresh(fetch, refill, status)
+
+        do_refresh()
 
     def _build_offenders_tab(self):
         """Resource Management: pods sorted worst-first by wasted memory
