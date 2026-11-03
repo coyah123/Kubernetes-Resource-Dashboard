@@ -166,6 +166,14 @@ and **Shell: bash**, via `kubectl exec -i`. Controllers (Deployments, StatefulSe
 DaemonSets, ReplicaSets, Jobs) and Nodes also get a **Pods** tab listing what they
 run, itself clickable.
 
+**🔎 Find (search in view)** — every detail view has a find bar pinned to the
+bottom. Type to live-highlight every match in whatever tab is showing (Describe /
+YAML / Events / a Pod's Logs), with the current match in amber and a `3/12`
+counter; **▶ / ◀** (or **Enter / Shift+Enter**) step through them and scroll each
+into view. It's case-insensitive, follows you as you switch tabs, and re-applies
+after a **⟳ Refresh** — so it works anywhere you click a resource (the detail
+window, the Argo map's inline panel, and the in-place detail in the list tabs).
+
 **Live edit** — every detail view has an **✎ Edit ▾** dropdown offering two ways
 to edit `<kind>/<name>`:
 

@@ -4371,7 +4371,9 @@ class ResourceDetailView(ttk.Frame):
         header.add(edit_mb, padx=6)
 
         nb = ttk.Notebook(self)
+        self._nb = nb
         nb.pack(fill="both", expand=True, padx=6, pady=6)
+        self._build_search_bar()
 
         self._build_cmd_tab(nb, "Describe", ["describe", kind, name] + nsargs)
         self._build_cmd_tab(nb, "YAML", ["get", kind, name] + nsargs + ["-o", "yaml"])
@@ -4548,6 +4550,7 @@ class ResourceDetailView(ttk.Frame):
     def _poll_cmd(self):
         if self._torn:
             return
+        updated = False
         try:
             while True:
                 txt, status, out, err = self._cmd_q.get_nowait()
@@ -4558,9 +4561,116 @@ class ResourceDetailView(ttk.Frame):
                 else:
                     txt.insert("1.0", out)
                     status.config(text=f"updated {time.strftime('%H:%M:%S')}")
+                updated = True
         except queue.Empty:
             pass
+        # Re-apply the active search over freshly-loaded content.
+        if updated and self._search_var.get():
+            self.after_idle(self._do_search)
         self._after_ids.append(self.after(150, self._poll_cmd))
+
+    # -- find-in-text search bar (bottom of the detail view) ---------------
+    def _build_search_bar(self):
+        """A live find-in-text bar pinned to the bottom of the detail view. It
+        searches whatever Text widget is in the currently-selected tab (Describe
+        / YAML / Events / Logs / …), highlighting every match and letting you
+        step through them."""
+        self._search_hits = []        # [(start_index, end_index)] in the widget
+        self._search_idx = -1
+        self._search_last = None      # last widget we tagged, to clear later
+
+        bar = ttk.Frame(self, padding=(4, 2))
+        bar.pack(side="bottom", fill="x")
+        ttk.Label(bar, text="🔎 Find:").pack(side="left")
+        self._search_var = tk.StringVar()
+        ent = ttk.Entry(bar, textvariable=self._search_var, width=30)
+        ent.pack(side="left", padx=4)
+        ent.bind("<KeyRelease>", self._do_search)
+        ent.bind("<Return>", lambda _e: self._search_step(1))
+        ent.bind("<Shift-Return>", lambda _e: self._search_step(-1))
+        ttk.Button(bar, text="◀", width=3,
+                   command=lambda: self._search_step(-1)).pack(side="left")
+        ttk.Button(bar, text="▶", width=3,
+                   command=lambda: self._search_step(1)).pack(side="left", padx=(2, 6))
+        self._search_count = ttk.Label(bar, text="")
+        self._search_count.pack(side="left")
+        # Re-run the search when the user switches tabs.
+        self._nb.bind("<<NotebookTabChanged>>", self._do_search, add="+")
+
+    def _active_search_text(self):
+        """The Text widget inside the currently-selected notebook tab, if any."""
+        try:
+            cur = self._nb.select()
+        except tk.TclError:
+            return None
+        if not cur:
+            return None
+
+        def find(w):
+            if isinstance(w, tk.Text):
+                return w
+            for c in w.winfo_children():
+                r = find(c)
+                if r is not None:
+                    return r
+            return None
+        try:
+            return find(self._nb.nametowidget(cur))
+        except (tk.TclError, KeyError):
+            return None
+
+    def _do_search(self, *_):
+        q = self._search_var.get()
+        # Clear highlights on whatever widget we tagged previously.
+        if self._search_last is not None:
+            try:
+                self._search_last.tag_remove("search", "1.0", "end")
+                self._search_last.tag_remove("search_cur", "1.0", "end")
+            except tk.TclError:
+                pass
+        w = self._active_search_text()
+        self._search_last = w
+        self._search_hits = []
+        self._search_idx = -1
+        if not w or not q:
+            self._search_count.config(text="")
+            return
+        w.tag_config("search", background="#5a5a00", foreground="white")
+        w.tag_config("search_cur", background="#d19a00", foreground="black")
+        start = "1.0"
+        while True:
+            pos = w.search(q, start, stopindex="end", nocase=1)
+            if not pos:
+                break
+            end = f"{pos}+{len(q)}c"
+            w.tag_add("search", pos, end)
+            self._search_hits.append((pos, end))
+            start = end
+        if self._search_hits:
+            self._search_goto(0)
+        else:
+            self._search_count.config(text="no matches")
+
+    def _search_goto(self, i):
+        if not self._search_hits:
+            return
+        w = self._search_last
+        if 0 <= self._search_idx < len(self._search_hits):
+            try:
+                w.tag_remove("search_cur", *self._search_hits[self._search_idx])
+            except tk.TclError:
+                pass
+        self._search_idx = i % len(self._search_hits)
+        pos, end = self._search_hits[self._search_idx]
+        w.tag_add("search_cur", pos, end)
+        w.see(pos)
+        self._search_count.config(text=f"{self._search_idx + 1}/{len(self._search_hits)}")
+
+    def _search_step(self, delta):
+        if not self._search_hits:
+            self._do_search()
+            return
+        self._search_goto(self._search_idx + delta)
 
     # -- secret decoder ("Get secret") -------------------------------------
     def _build_secret_tab(self, nb):
