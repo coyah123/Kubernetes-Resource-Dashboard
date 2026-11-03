@@ -566,25 +566,12 @@ def build_model_from_raw(raw: dict) -> dict:
     node_rows = [build_node_row(n, node_usage.get(n["metadata"]["name"], (None, None)))
                  for n in nodes.get("items", [])]
 
-    # Per-node pod aggregates, computed once here from the FULL pod list so the
-    # Nodes table never depends on self.model["pods"], which other tabs replace
-    # with namespace-scoped subsets (that scoping used to undercount pods/node).
-    node_agg = {}
-
     pod_rows = []
     dep_usage = {}  # (ns, deployment) -> [cpu_m, mem_b] summed actual usage of its pods
     for p in pods.get("items", []):
         ns, name = p["metadata"]["namespace"], p["metadata"]["name"]
         row = build_pod_row(p, pod_usage.get((ns, name), (None, None)))
         pod_rows.append(row)
-        a = node_agg.setdefault(
-            row["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
-        a["pods"] += 1
-        a["cpu"] += row["cpu_req_m"]
-        a["mem"] += row["mem_req_b"]
-        # host-network pods share the node's own IP, not a distinct pod IP.
-        if not row.get("host_network"):
-            a["ips"] += 1
         # Attribute this pod's usage to a Deployment (via its ReplicaSet owner).
         refs = p["metadata"].get("ownerReferences", [])
         dep_name = next((rs_to_dep.get((ns, o["name"])) for o in refs
@@ -598,8 +585,33 @@ def build_model_from_raw(raw: dict) -> dict:
         (d["metadata"]["namespace"], d["metadata"]["name"])))
         for d in deployments.get("items", [])]
 
-    # Attach the per-node pod aggregates so the Nodes table reads them straight
-    # off the node row instead of re-summing the (mutable, possibly-scoped) pods.
+    # Attach the per-node pod aggregates from the FULL pod list so the Nodes
+    # table never depends on self.model["pods"], which other tabs replace with
+    # namespace-scoped subsets (that scoping used to undercount pods/node).
+    attach_node_aggregates(node_rows, pod_rows)
+
+    return {"nodes": node_rows, "pods": pod_rows, "deployments": dep_rows}
+
+
+def attach_node_aggregates(node_rows: list[dict], pod_rows: list[dict]) -> None:
+    """Attach per-node pod aggregates (pod count, summed CPU/mem requests, and
+    distinct-IP count) to each node row, computed from a FULL pod-row list.
+
+    The Nodes table reads these off the node row (agg_pods / agg_cpu_m /
+    agg_mem_b / agg_ips) instead of re-summing self.model["pods"], which other
+    tabs replace with namespace-scoped subsets. Any refresh that rebuilds node
+    rows MUST call this with the complete pod list, or the pods/req%/used columns
+    collapse to zero."""
+    node_agg = {}
+    for row in pod_rows:
+        a = node_agg.setdefault(
+            row["node"], {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0})
+        a["pods"] += 1
+        a["cpu"] += row["cpu_req_m"]
+        a["mem"] += row["mem_req_b"]
+        # host-network pods share the node's own IP, not a distinct pod IP.
+        if not row.get("host_network"):
+            a["ips"] += 1
     empty = {"pods": 0, "cpu": 0.0, "mem": 0.0, "ips": 0}
     for n in node_rows:
         a = node_agg.get(n["node"], empty)
@@ -607,8 +619,6 @@ def build_model_from_raw(raw: dict) -> dict:
         n["agg_cpu_m"] = a["cpu"]
         n["agg_mem_b"] = a["mem"]
         n["agg_ips"] = a["ips"]
-
-    return {"nodes": node_rows, "pods": pod_rows, "deployments": dep_rows}
 
 
 # ---------------------------------------------------------------------------
@@ -1961,8 +1971,15 @@ class Dashboard(tk.Tk):
             def fetch():
                 nodes = kubectl_collect.list_items("nodes", context=ctx())
                 nu = self._node_usage_map(ctx())
-                return [build_node_row(n, nu.get(n["metadata"]["name"], (None, None)))
+                rows = [build_node_row(n, nu.get(n["metadata"]["name"], (None, None)))
                         for n in nodes]
+                # Recompute per-node aggregates from the FULL pod list — otherwise
+                # fresh node rows have no agg_* fields and the pods/req%/used
+                # columns read zero (see attach_node_aggregates).
+                pods = kubectl_collect.list_items(
+                    "pods", all_namespaces=True, context=ctx())
+                attach_node_aggregates(rows, [build_pod_row(p) for p in pods])
+                return rows
 
             def apply(rows):
                 self.model["nodes"] = rows
@@ -2463,8 +2480,14 @@ class Dashboard(tk.Tk):
             def fetch():
                 nodes = kubectl_collect.list_items("nodes", context=ctx0)
                 nu = self._node_usage_map(ctx0)
-                return [build_node_row(n, nu.get(n["metadata"]["name"], (None, None)))
+                rows = [build_node_row(n, nu.get(n["metadata"]["name"], (None, None)))
                         for n in nodes]
+                # Also pull the full pod list so the node rows carry correct
+                # aggregates if the user switches to the Nodes tab next.
+                pods = kubectl_collect.list_items(
+                    "pods", all_namespaces=True, context=ctx0)
+                attach_node_aggregates(rows, [build_pod_row(p) for p in pods])
+                return rows
 
             def apply(rows):
                 self.model["nodes"] = rows
