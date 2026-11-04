@@ -593,6 +593,16 @@ def build_model_from_raw(raw: dict) -> dict:
     return {"nodes": node_rows, "pods": pod_rows, "deployments": dep_rows}
 
 
+def friendly_kubectl_error(err: object) -> str:
+    """A short, user-facing version of a kubectl failure. RBAC denials are
+    flagged as such so a limited user understands a section is empty by
+    permission, not a bug; other failures show their last (most specific) line."""
+    if kubectl_collect.is_access_error(err):
+        return "🔒 access denied — you don't have permission for this"
+    lines = [ln for ln in str(err).strip().splitlines() if ln.strip()]
+    return lines[-1] if lines else "failed"
+
+
 def attach_node_aggregates(node_rows: list[dict], pod_rows: list[dict]) -> None:
     """Attach per-node pod aggregates (pod count, summed CPU/mem requests, and
     distinct-IP count) to each node row, computed from a FULL pod-row list.
@@ -1091,6 +1101,8 @@ class Dashboard(tk.Tk):
         self.refresh_btn.pack(side="left", padx=4)
         ttk.Button(live, text="Reload contexts",
                    command=self.load_contexts).pack(side="left")
+        ttk.Button(live, text="🔒 My access…",
+                   command=self._show_my_access).pack(side="left", padx=4)
         self.cache_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(live, text="also save JSON to data folder",
                         variable=self.cache_var).pack(side="left", padx=8)
@@ -1109,6 +1121,21 @@ class Dashboard(tk.Tk):
         bar.pack(fill="x")
         self.status = ttk.Label(bar, text="")
         self.status.pack(side="left")
+
+        # --- Row 3b: permissions banner (hidden until a refresh hits denials) --
+        # RBAC-limited users still get everything they CAN see; this non-fatal
+        # banner names what was denied so missing data isn't a mystery.
+        self._perm_banner = tk.Frame(self, background="#5a4a1e")
+        self._perm_label = tk.Label(
+            self._perm_banner, background="#5a4a1e", foreground="white",
+            justify="left", anchor="w", padx=8, pady=4,
+            font=("", 9), wraplength=1100)
+        self._perm_label.pack(side="left", fill="x", expand=True)
+        tk.Button(self._perm_banner, text="✕", command=self._hide_perm_banner,
+                  background="#5a4a1e", foreground="white", relief="flat",
+                  borderwidth=0, activebackground="#6a5a2e",
+                  activeforeground="white").pack(side="right", padx=4)
+        # Not packed yet — _show_perm_banner packs it above the body when needed.
 
         # --- Bottom: kubectl command buffer ("don't make me dumb") ------------
         # Packed side=bottom BEFORE the body so it stays pinned to the window's
@@ -1141,6 +1168,7 @@ class Dashboard(tk.Tk):
         style.layout("Sidebar.TNotebook.Tab", [])
 
         body = ttk.Frame(self)
+        self._body = body
         body.pack(fill="both", expand=True, padx=6, pady=6)
 
         self._sidebar_open = True
@@ -1411,8 +1439,11 @@ class Dashboard(tk.Tk):
         self._busy = False
         self.refresh_btn.state(["!disabled"])
         if kind == "err":
-            self.status.config(text="⚠ kubectl failed")
-            messagebox.showerror("kubectl error", str(payload))
+            self._hide_perm_banner()
+            access = kubectl_collect.is_access_error(payload)
+            self.status.config(text="⚠ access denied" if access else "⚠ kubectl failed")
+            messagebox.showerror(
+                "Access denied" if access else "kubectl error", str(payload))
             return
 
         raw = payload
@@ -1420,6 +1451,86 @@ class Dashboard(tk.Tk):
             self._save_raw(raw)
         self.model = build_model_from_raw(raw)
         self._render(source=f"context “{self.context_var.get()}”")
+        # Surface anything the user wasn't allowed to pull (non-fatal).
+        self._show_perm_banner(raw.get("_errors") or {})
+
+    def _show_perm_banner(self, errors: dict):
+        """Show/hide the non-fatal permissions banner. ``errors`` maps a human
+        label to the kubectl message for each pull that was denied or failed —
+        access denials are called out as such, other failures noted plainly."""
+        if not errors:
+            self._hide_perm_banner()
+            return
+        denied = [k for k, v in errors.items() if kubectl_collect.is_access_error(v)]
+        other = [k for k in errors if k not in denied]
+        parts = []
+        if denied:
+            parts.append("🔒 No access to: " + ", ".join(denied)
+                         + " — those sections will be empty.")
+        if other:
+            parts.append("⚠ Couldn't load: " + ", ".join(other) + ".")
+        parts.append("Everything you do have access to is shown.")
+        self._perm_label.config(text="  ".join(parts))
+        # Pack just above the main body so it spans the window width.
+        self._perm_banner.pack(fill="x", before=self._body)
+
+    def _hide_perm_banner(self):
+        self._perm_banner.pack_forget()
+
+    def _show_my_access(self):
+        """Pop a window showing `kubectl auth can-i --list` for the current user
+        and context — exactly what they're allowed to do. Lets an RBAC-limited
+        user confirm that empty sections are a permissions boundary, not a bug."""
+        ctx = self.context_var.get().strip()
+        win = tk.Toplevel(self)
+        win.title("My access (kubectl auth can-i --list)")
+        win.geometry("760x520")
+
+        bar = ttk.Frame(win, padding=6)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Namespace:").pack(side="left")
+        ns_var = tk.StringVar(value="")
+        ttk.Entry(bar, textvariable=ns_var, width=24).pack(side="left", padx=4)
+        ttk.Label(bar, text="(blank = default ns + cluster-scoped rules)").pack(side="left")
+        refresh_btn = ttk.Button(bar, text="⟳ Check")
+        refresh_btn.pack(side="right")
+        status = ttk.Label(win, padding=(6, 0), text="")
+        status.pack(anchor="w")
+
+        txt = tk.Text(win, wrap="none", font=("Consolas", 9))
+        vs = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        hs = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        hs.pack(side="bottom", fill="x")
+        vs.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+
+        def load():
+            refresh_btn.state(["disabled"])
+            status.config(text="⏳ querying…")
+            txt.delete("1.0", "end")
+            ns = ns_var.get().strip()
+
+            def work():
+                try:
+                    out = kubectl_collect.auth_can_i_list(namespace=ns, context=ctx)
+                    msg, ok = out, True
+                except Exception as e:  # noqa: BLE001 — surfaced in the window
+                    msg, ok = str(e), False
+
+                def done():
+                    if not win.winfo_exists():
+                        return
+                    refresh_btn.state(["!disabled"])
+                    txt.insert("1.0", msg)
+                    status.config(text="✓ your current access"
+                                  if ok else "⚠ couldn't query access")
+                self.after(0, done)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        refresh_btn.config(command=load)
+        load()
 
     def _save_raw(self, raw: dict):
         """Cache the raw kubectl JSON to the data folder for offline reloads."""
@@ -1449,6 +1560,7 @@ class Dashboard(tk.Tk):
             return
         self.model = build_model(folder)
         self._render(source=f"files in {folder}")
+        self._hide_perm_banner()   # offline snapshot — no live permission state
 
     def _render(self, source: str = ""):
         """Update the status summary line and rebuild every analysis tab."""
@@ -1632,7 +1744,8 @@ class Dashboard(tk.Tk):
             try:
                 data = fetch_fn()
             except Exception as e:  # noqa: BLE001
-                self.after(0, lambda err=e: status_lbl.config(text=f"⚠ {err}"))
+                self.after(0, lambda err=e: status_lbl.config(
+                    text=f"⚠ {friendly_kubectl_error(err)}"))
                 return
             self.after(0, lambda: done(data))
 
@@ -3024,16 +3137,37 @@ class Dashboard(tk.Tk):
                     idx.setdefault(key, []).append((kind, ktype, obj))
             return idx
 
-        def make_node(kind, name, ns, ktype, sync, health, idx, depth=0):
+        def make_node(kind, name, ns, ktype, sync, health, idx, depth=0, seen=None):
             node = {"kind": kind, "name": name, "ns": ns, "ktype": ktype,
                     "sync": sync, "health": health, "children": []}
-            if depth < 6:  # guard against any pathological owner cycle
+            sig = (kind.lower(), name, ns)
+            seen = seen or frozenset()
+            # Depth bound + an ancestor set guard against owner cycles and any
+            # app-of-apps loop (an Application that transitively references itself).
+            if depth < 8 and sig not in seen:
+                seen = seen | {sig}
+                # Workload children reconstructed from ownerReferences (rs → pods).
                 for ckind, cktype, cobj in idx.get((kind.lower(), name, ns), []):
                     cmeta = cobj.get("metadata", {})
                     chealth = pod_health(cobj) if ckind == "Pod" else ""
                     node["children"].append(make_node(
                         ckind, cmeta.get("name", ""), ns, cktype, "",
-                        chealth, idx, depth + 1))
+                        chealth, idx, depth + 1, seen))
+                # App-of-apps: if this node is an Argo Application we also fetched,
+                # expand the resources IT manages (which may be more Applications,
+                # recursing until we bottom out at plain workloads).
+                if kind == "Application":
+                    child_app = getattr(self, "_argo_app_index", {}).get((name, ns))
+                    if child_app:
+                        for r in child_app.get("status", {}).get("resources", []) or []:
+                            rkind, rname = r.get("kind", ""), r.get("name", "")
+                            rns = r.get("namespace", "") or ns
+                            group = r.get("group", "")
+                            rktype = f"{rkind.lower()}.{group}" if group else rkind.lower()
+                            node["children"].append(make_node(
+                                rkind, rname, rns, rktype, r.get("status", ""),
+                                (r.get("health") or {}).get("status", ""),
+                                idx, depth + 1, seen))
             return node
 
         BW, BH, HGAP, VGAP = 180, 48, 80, 18
@@ -3129,20 +3263,13 @@ class Dashboard(tk.Tk):
             meta = app.get("metadata", {})
             st = app.get("status", {})
             idx = children_index()
+            # make_node expands the Application's managed resources from the app
+            # index (top-level resources, each then grown via ownerReferences, and
+            # any child Applications recursed into — the app-of-apps case).
             root = make_node(
                 "Application", meta.get("name", ""), meta.get("namespace", ""),
                 "applications.argoproj.io", st.get("sync", {}).get("status", ""),
                 st.get("health", {}).get("status", ""), idx)
-            # Build the whole tree first (top-level managed resources as the
-            # Application's children, each then expanded via ownerReferences).
-            for r in st.get("resources", []) or []:
-                kind, name = r.get("kind", ""), r.get("name", "")
-                ns = r.get("namespace", "") or meta.get("namespace", "")
-                group = r.get("group", "")
-                ktype = f"{kind.lower()}.{group}" if group else kind.lower()
-                root["children"].append(make_node(
-                    kind, name, ns, ktype, r.get("status", ""),
-                    (r.get("health") or {}).get("status", ""), idx))
             current_root["node"] = root
             (render_list if view_mode.get() == "List" else render_map)(root)
 
@@ -3222,6 +3349,12 @@ class Dashboard(tk.Tk):
             list_targets.clear()
             self._argo_rs = data.get("rs", [])
             self._argo_pods = data.get("pods", [])
+            # (name, namespace) -> Application, so an app-of-apps can expand the
+            # child Applications it manages into their own resource subtrees.
+            self._argo_app_index = {
+                (a.get("metadata", {}).get("name", ""),
+                 a.get("metadata", {}).get("namespace", "")): a
+                for a in data.get("apps", [])}
             items = sorted(data.get("apps", []), key=lambda a: (
                 a.get("metadata", {}).get("namespace", ""),
                 a.get("metadata", {}).get("name", "")))
@@ -3238,8 +3371,16 @@ class Dashboard(tk.Tk):
                 status.config(text=f"{len(items)} application(s) — "
                                    "select one to see its tree")
             else:
-                status.config(text="No Argo Applications found "
-                                   "(is Argo CD installed on this cluster?)")
+                err = data.get("apps_err")
+                if err is not None and kubectl_collect.is_access_error(err):
+                    status.config(text="🔒 You don't have access to list Argo "
+                                       "Applications in this cluster.")
+                elif err is not None:
+                    status.config(text="⚠ Couldn't load Argo Applications: "
+                                       + friendly_kubectl_error(err))
+                else:
+                    status.config(text="No Argo Applications found "
+                                       "(is Argo CD installed on this cluster?)")
 
         def refresh_selected_app():
             """Re-fetch ONLY the selected Application and the ReplicaSets/Pods in
@@ -3274,6 +3415,8 @@ class Dashboard(tk.Tk):
             def apply(data):
                 fresh, nss, rs, pods = data
                 self._argo_apps[iid] = fresh
+                if hasattr(self, "_argo_app_index"):
+                    self._argo_app_index[(name, app_ns)] = fresh
                 st = fresh.get("status", {})
                 sync_s = st.get("sync", {}).get("status", "")
                 health_s = st.get("health", {}).get("status", "")
@@ -3290,9 +3433,18 @@ class Dashboard(tk.Tk):
 
         def do_refresh():
             def fetch():
+                # Fetch Applications with the raising variant so an RBAC denial
+                # can be distinguished from "Argo isn't installed" (both would
+                # otherwise look like an empty list).
+                try:
+                    apps_list = kubectl_collect.list_items(
+                        "applications.argoproj.io", all_namespaces=True, context=ctx())
+                    apps_err = None
+                except kubectl_collect.KubectlError as e:
+                    apps_list, apps_err = [], e
                 return {
-                    "apps": kubectl_collect.list_items_safe(
-                        "applications.argoproj.io", context=ctx()),
+                    "apps": apps_list,
+                    "apps_err": apps_err,
                     "rs": kubectl_collect.list_items_safe("rs", context=ctx()),
                     "pods": kubectl_collect.list_items_safe("pods", context=ctx()),
                 }
@@ -4361,6 +4513,9 @@ class ResourceDetailView(ttk.Frame):
 
         # async command plumbing (describe/yaml/events run off the UI thread)
         self._cmd_q: queue.Queue = queue.Queue()
+        # text tabs built via _build_cmd_tab, so a successful in-app edit can
+        # re-run them all and show the applied change without a manual refresh.
+        self._cmd_tabs = []           # [(args, txt, status)]
         # live-logs plumbing
         self._log_proc = None
         self._log_q: queue.Queue = queue.Queue()
@@ -4493,6 +4648,10 @@ class ResourceDetailView(ttk.Frame):
                     apply_btn.config(state="normal")
                     messagebox.showerror("Apply failed", str(err), parent=win)
                 else:
+                    # Reflect the applied change in the detail view behind the
+                    # dialog (Describe/YAML/Events) so it doesn't look stale.
+                    if not self._torn:
+                        self._refresh_cmd_tabs()
                     messagebox.showinfo("Applied", out.strip() or "Applied.", parent=win)
                     win.destroy()
 
@@ -4556,7 +4715,14 @@ class ResourceDetailView(ttk.Frame):
         vs.pack(side="right", fill="y")
         hs.pack(fill="x")
 
+        self._cmd_tabs.append((args, txt, status))
         self._run_cmd(args, txt, status)  # populate immediately
+
+    def _refresh_cmd_tabs(self):
+        """Re-run every Describe/YAML/Events tab (used after an in-app edit so the
+        applied change is reflected without the user hitting ⟳ Refresh)."""
+        for args, txt, status in self._cmd_tabs:
+            self._run_cmd(args, txt, status)
 
     def _run_cmd(self, args, txt, status):
         status.config(text="⏳ running…")
@@ -5816,7 +5982,7 @@ class ResourceBrowser(ttk.Frame):
                     if self.ns_var.get() not in self._namespaces:
                         self.ns_var.set("(all)")
                 if status == "err":
-                    self.status.config(text=f"⚠ {payload}")
+                    self.status.config(text=f"⚠ {friendly_kubectl_error(payload)}")
                 elif status == "action_ok":
                     self.status.config(text=f"✓ {payload}")
                 else:

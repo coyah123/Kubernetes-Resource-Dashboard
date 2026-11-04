@@ -71,6 +71,21 @@ That's it. The app starts empty and only shows data after you refresh (or click
 **Load files** on a cached snapshot). Optionally tick "also save JSON to data
 folder" to cache a snapshot you can reopen later (offline / air-gapped).
 
+**Works with limited RBAC.** You don't need cluster-admin — the app shows
+everything you *can* read and degrades gracefully on what you can't. Each
+resource is fetched independently, so a `forbidden` on (say) nodes or a single
+namespace scope empties just that section instead of failing the whole refresh.
+When a refresh hits any denials, a non-fatal banner names which sections are
+empty by permission (not by bug). The refresh only errors out entirely if
+*every* core resource is denied/unreachable — a sign the context itself is
+unusable (wrong VPN, expired creds, or no read access at all).
+
+**🔒 My access…** (top row) opens a window showing `kubectl auth can-i --list`
+for your user in the selected context — exactly what you're allowed to do. Enter
+a namespace to scope it, or leave it blank for the default namespace plus
+cluster-scoped rules. Use it to confirm an empty tab is a permissions boundary
+rather than a problem with the app.
+
 **Tabs:**
 - **🏠 Overview** — cluster summary: node/deploy/pod counts, capacity (allocatable
   vs requested vs used) for CPU and memory, and the biggest memory offenders
@@ -323,8 +338,19 @@ kubectl get pods -A -o json                        # Pods, joined to their Repli
 Each Pod/ReplicaSet is attached under the parent named in its
 `metadata.ownerReferences`, so the Pods you see under a Deployment are the actual
 Pods that Deployment is running right now in the snapshot. (Pod health in the
-graph is derived from phase/container state the same way Argo shows it.) If Argo
-CD isn't installed, the first call simply returns nothing and the tab says so.
+graph is derived from phase/container state the same way Argo shows it.)
+
+**App-of-apps.** When an `Application` manages *other* Applications (the
+"app-of-apps" pattern), each child Application's own `status.resources` is
+expanded in place too — so the tree keeps recursing down through nested
+Applications until it bottoms out at real workloads/Pods, instead of stopping at
+the first child Application box. (A depth bound plus an ancestor check guard
+against any self-referential app-of-apps loop.)
+
+If Argo CD isn't installed, the first call returns nothing and the tab says so —
+and it now distinguishes that from an **RBAC denial**: if you simply aren't
+allowed to list Applications, the tab says *"🔒 You don't have access…"* rather
+than implying Argo is absent.
 
 ### Trends tab (capture over a day)
 
@@ -689,6 +715,14 @@ kubectl top pods -A --sum=true                            # human-readable equiv
 kubectl top nodes                                         # human-readable equivalent
 ```
 
+**Your RBAC** — what the current user is allowed to do, behind the **🔒 My
+access…** button (optionally scoped to a namespace with `-n`):
+
+```bash
+kubectl auth can-i --list                 # default ns + cluster-scoped rules
+kubectl auth can-i --list -n <namespace>  # that namespace's rules
+```
+
 ## Troubleshooting / common snags
 
 - **`ModuleNotFoundError: No module named 'tkinter'`** — your Python was built
@@ -724,7 +758,10 @@ kubectl top nodes                                         # human-readable equiv
   context uses.
 - **403 / "forbidden" on some resources** — the app lists across *all* namespaces
   (`-A`). If your account is scoped to a single namespace you won't have
-  cluster-wide read; ask for read (list) access on deployments/pods/nodes.
+  cluster-wide read; ask for read (list) access on deployments/pods/nodes. This
+  is non-fatal: the app shows what you *can* see and flags the denied sections in
+  a banner. Click **🔒 My access…** to see exactly what your account is allowed
+  to do.
 - **Usage columns are blank / "no metrics-server"** — that cluster has no
   metrics-server installed. Everything else still works; only live usage numbers
   are unavailable.

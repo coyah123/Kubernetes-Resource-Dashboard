@@ -29,6 +29,23 @@ class KubectlError(RuntimeError):
     """kubectl is missing, misconfigured, or a command failed."""
 
 
+def is_access_error(err: object) -> bool:
+    """True if ``err`` (an exception or message) looks like an RBAC / permission
+    denial rather than a real outage — so callers can degrade gracefully (show
+    what the user CAN see, skip and note what they can't) instead of aborting.
+
+    Covers the common kubectl phrasings: "forbidden", "cannot list/get/watch
+    resource", and a bare "Unauthorized" (expired/absent credentials)."""
+    msg = str(err).lower()
+    return any(s in msg for s in (
+        "forbidden",
+        "cannot list", "cannot get", "cannot watch", "cannot create",
+        "cannot delete", "cannot patch", "cannot update",
+        "unauthorized",
+        "doesn't have permission", "does not have permission",
+    ))
+
+
 def _base_cmd() -> list[str]:
     """The kubectl invocation, honoring a KUBECTL override like 'sudo k3s kubectl'."""
     override = os.environ.get("KUBECTL", "").strip()
@@ -139,6 +156,20 @@ def _run(args: list[str], *, context: str = "", timeout: int = 60) -> str:
 
 def run_text(args: list[str], *, context: str = "", timeout: int = 60) -> str:
     """Run `kubectl <args>` and return its raw text output (describe/get/etc.)."""
+    return _run(args, context=context, timeout=timeout)
+
+
+def auth_can_i_list(*, namespace: str = "", context: str = "", timeout: int = 20) -> str:
+    """`kubectl auth can-i --list` — the RBAC the CURRENT user actually has.
+
+    Returns the raw table kubectl prints (Resources / Verbs / etc.). With no
+    namespace it reports the user's access in the ``default`` namespace plus all
+    cluster-scoped rules; pass a namespace to see that namespace's rules. Lets a
+    user see exactly why sections of the dashboard are empty — it's their RBAC,
+    not a bug. Raises KubectlError only if the call itself can't run."""
+    args = ["auth", "can-i", "--list"]
+    if namespace:
+        args += ["-n", namespace]
     return _run(args, context=context, timeout=timeout)
 
 
@@ -490,32 +521,59 @@ def collect(context: str = "", *, timeout: int = 60) -> dict:
     Pull everything the dashboard needs, in memory, from the live cluster.
 
     Returns a dict with keys: deployments, replicasets, pods, nodes, pod_metrics,
-    node_metrics (each the parsed kubectl JSON). metrics-server data degrades to {}
-    if the metrics API isn't available, so the dashboard still works without it.
-    ReplicaSets are used to attribute pod usage back to its owning Deployment.
-    """
-    deployments = _get_json(["get", "deploy", "-A", "-o", "json"], context=context, timeout=timeout)
-    replicasets = _get_json(["get", "rs", "-A", "-o", "json"], context=context, timeout=timeout)
-    pods = _get_json(["get", "pods", "-A", "-o", "json"], context=context, timeout=timeout)
-    nodes = _get_json(["get", "nodes", "-o", "json"], context=context, timeout=timeout)
+    node_metrics (each the parsed kubectl JSON), plus ``_errors`` — a mapping of
+    {human label -> error message} for any pull the user wasn't allowed to run
+    (or that otherwise failed).
 
-    # metrics-server: kubectl top has no JSON, so hit the raw metrics API. Optional.
-    try:
-        pod_metrics = _get_json(
-            ["get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"], context=context, timeout=timeout)
-    except KubectlError:
-        pod_metrics = {}
-    try:
-        node_metrics = _get_json(
-            ["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"], context=context, timeout=timeout)
-    except KubectlError:
-        node_metrics = {}
+    RBAC-friendly: each resource is fetched independently and a failure degrades
+    that one resource to {} instead of aborting the whole pull, so a user who
+    (say) can't list nodes or isn't cluster-wide still gets everything else they
+    *can* see. metrics-server data likewise degrades to {} if it isn't installed.
+
+    The ONE case that still raises is a total failure — every core resource
+    (deployments/replicasets/pods/nodes) denied or unreachable — which means the
+    context is unusable (wrong network/VPN, expired creds, or no read at all);
+    there's nothing to show, so the caller gets a single clear error instead of
+    an empty screen.
+    """
+    errors: dict[str, str] = {}
+
+    def safe(label: str, args: list[str]) -> dict:
+        try:
+            return _get_json(args, context=context, timeout=timeout)
+        except KubectlError as e:
+            errors[label] = str(e)
+            return {}
+
+    # Core resources the model is built from.
+    core = {
+        "deployments": safe("deployments", ["get", "deploy", "-A", "-o", "json"]),
+        "replicasets": safe("replicasets", ["get", "rs", "-A", "-o", "json"]),
+        "pods": safe("pods", ["get", "pods", "-A", "-o", "json"]),
+        "nodes": safe("nodes", ["get", "nodes", "-o", "json"]),
+    }
+
+    # If EVERY core pull failed, the context is unusable — surface the real
+    # reason (connection/auth/RBAC) as one error rather than a blank dashboard.
+    if len(errors) == len(core):
+        reasons = "\n".join(f"• {k}: {v.splitlines()[-1] if v else v}"
+                            for k, v in errors.items())
+        raise KubectlError(
+            "Couldn't read anything from this context — every core resource "
+            "was denied or unreachable. Check that you're on the right "
+            "network/VPN, your credentials are valid, and you have read "
+            "(list) access.\n\n" + reasons)
+
+    # metrics-server: kubectl top has no JSON, so hit the raw metrics API.
+    # Optional everywhere, and commonly denied/absent — note it but don't fuss.
+    pod_metrics = safe("pod metrics (metrics-server)",
+                       ["get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods"])
+    node_metrics = safe("node metrics (metrics-server)",
+                        ["get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"])
 
     return {
-        "deployments": deployments,
-        "replicasets": replicasets,
-        "pods": pods,
-        "nodes": nodes,
+        **core,
         "pod_metrics": pod_metrics,
         "node_metrics": node_metrics,
+        "_errors": errors,
     }
