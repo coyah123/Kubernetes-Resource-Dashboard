@@ -2860,8 +2860,11 @@ class Dashboard(tk.Tk):
         # child kinds so custom-resource children (cert-manager chains, operator
         # CRs, …) render — not just ReplicaSet→Pod. Heavier, hence off by default.
         deep_var = tk.BooleanVar(value=False)
+        # Toggling only re-renders the CURRENT selection (the scoped deep fetch
+        # lives in show_app) — it must NOT do_refresh(), which would wipe the app
+        # list and clear the selected tree.
         ttk.Checkbutton(bar, text="Deep (expand CRD children)", variable=deep_var,
-                        command=lambda: do_refresh()).pack(side="left", padx=(12, 0))
+                        command=lambda: show_app()).pack(side="left", padx=(12, 0))
 
         ttk.Label(bar, text="View:").pack(side="left", padx=(12, 2))
         view_mode = tk.StringVar(value="Map")
