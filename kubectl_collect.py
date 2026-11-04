@@ -394,7 +394,8 @@ def list_crds(context: str = "") -> list[dict]:
     return sorted(out, key=lambda c: (c["group"], c["kind"]))
 
 
-def collect_owner_candidates(context: str = "", *, timeout: int = 30) -> list[tuple]:
+def collect_owner_candidates(context: str = "", *, namespaces: list[str] | None = None,
+                             timeout: int = 30) -> list[tuple]:
     """``(kind, ktype, obj)`` for every object that could be an ownerReferences
     child in the Argo resource tree — used for the opt-in "deep / CRD" expansion.
 
@@ -406,11 +407,28 @@ def collect_owner_candidates(context: str = "", *, timeout: int = 30) -> list[tu
     kinds, tag each with its known kind/ktype, and let ``children_index`` walk
     ownerReferences across all of them.
 
+    ``namespaces`` scopes the pull: when given, namespaced kinds are fetched ONLY
+    in those namespaces (one ``kubectl get -n ns`` per kind per namespace) — far
+    cheaper than cluster-wide, and all the Argo tab needs since it expands one
+    selected app. Cluster-scoped CRDs are always fetched once (no namespace).
+    When ``namespaces`` is None, everything is pulled across all namespaces.
+
     Best-effort: each kind is fetched independently and a denied/absent kind is
-    skipped (returns []), so a limited user still gets whatever they can read.
-    This is heavier than the default refresh (one ``kubectl get`` per kind), which
-    is why the GUI puts it behind a toggle."""
+    skipped (returns []), so a limited user still gets whatever they can read."""
     out: list[tuple] = []
+
+    def grab(kind: str, ktype: str, cluster_scoped: bool = False):
+        if namespaces is None or cluster_scoped:
+            objs = list_items_safe(ktype, context=context, timeout=timeout)
+            out.extend((kind, ktype, o) for o in objs)
+            return
+        for ns in namespaces:
+            try:
+                objs = list_items(ktype, namespace=ns, context=context, timeout=timeout)
+            except KubectlError:
+                objs = []
+            out.extend((kind, ktype, o) for o in objs)
+
     # Built-in kinds that commonly appear as managed children but aren't in the
     # rs/pods snapshot. (ReplicaSets and Pods are collected separately already.)
     builtins = [
@@ -426,13 +444,10 @@ def collect_owner_candidates(context: str = "", *, timeout: int = 30) -> list[tu
         ("HorizontalPodAutoscaler", "horizontalpodautoscalers.autoscaling"),
     ]
     for kind, ktype in builtins:
-        for obj in list_items_safe(ktype, context=context, timeout=timeout):
-            out.append((kind, ktype, obj))
+        grab(kind, ktype)
     # Every installed CRD's instances, tagged with the CRD's own kind + fq name.
     for crd in list_crds(context=context):
-        kind, fq = crd["kind"], crd["fq"]
-        for obj in list_items_safe(fq, context=context, timeout=timeout):
-            out.append((kind, fq, obj))
+        grab(crd["kind"], crd["fq"], cluster_scoped=(crd.get("scope") == "Cluster"))
     return out
 
 

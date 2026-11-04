@@ -3262,13 +3262,9 @@ class Dashboard(tk.Tk):
                 (render_list if view_mode.get() == "List" else render_map)(
                     current_root["node"])
 
-        def show_app(_e=None):
-            current_root["node"] = None
-            canvas.delete("all")
-            node_targets.clear()
-            app = self._argo_apps.get(apps.focus())
-            if not app:
-                return
+        def render_app(app):
+            """Build + draw the selected app's tree from the in-memory snapshots
+            (rs/pods + whatever deep CRD children are currently loaded)."""
             meta = app.get("metadata", {})
             st = app.get("status", {})
             idx = children_index()
@@ -3281,6 +3277,58 @@ class Dashboard(tk.Tk):
                 st.get("health", {}).get("status", ""), idx)
             current_root["node"] = root
             (render_list if view_mode.get() == "List" else render_map)(root)
+
+        def app_namespaces(app, seen=None):
+            """Every namespace the app's managed resources live in, following
+            app-of-apps into child Applications — the scope for a deep fetch."""
+            seen = seen if seen is not None else set()
+            meta = app.get("metadata", {})
+            sig = (meta.get("name", ""), meta.get("namespace", ""))
+            if sig in seen:
+                return set()
+            seen.add(sig)
+            nss = {meta.get("namespace", "")}
+            for r in app.get("status", {}).get("resources", []) or []:
+                rns = r.get("namespace", "")
+                if rns:
+                    nss.add(rns)
+                if r.get("kind") == "Application":
+                    child = getattr(self, "_argo_app_index", {}).get(
+                        (r.get("name", ""), rns or meta.get("namespace", "")))
+                    if child:
+                        nss |= app_namespaces(child, seen)
+            return {n for n in nss if n}
+
+        def show_app(_e=None):
+            current_root["node"] = None
+            canvas.delete("all")
+            node_targets.clear()
+            iid = apps.focus()
+            app = self._argo_apps.get(iid)
+            if not app:
+                return
+            if not deep_var.get():
+                self._argo_extra = []
+                render_app(app)
+                return
+            # Deep mode: pull CRD/built-in children scoped to JUST this app's
+            # namespaces (off-thread), then redraw. Scoping keeps it fast — a
+            # cluster-wide pull of every CRD was far too slow.
+            nss = sorted(app_namespaces(app))
+            render_app(app)   # draw the light tree immediately; deepen when ready
+
+            def fetch():
+                return kubectl_collect.collect_owner_candidates(
+                    ctx(), namespaces=nss)
+
+            def apply(extra):
+                # Ignore if the user moved to another app while we were fetching.
+                if apps.focus() != iid:
+                    return
+                self._argo_extra = extra
+                render_app(app)
+
+            self._scoped_refresh(fetch, apply, status)
 
         # List view: ☑ checkbox select + ⧉/double-click to open (via MultiSelect),
         # plus command preview on select and a right-click menu.
@@ -3358,9 +3406,10 @@ class Dashboard(tk.Tk):
             list_targets.clear()
             self._argo_rs = data.get("rs", [])
             self._argo_pods = data.get("pods", [])
-            # (kind, ktype, obj) for the opt-in deep CRD/built-in walk; empty
-            # unless "Deep" is ticked. Folded into children_index alongside rs/pods.
-            self._argo_extra = data.get("extra", [])
+            # (kind, ktype, obj) for the opt-in deep CRD/built-in walk; populated
+            # lazily per selected app (show_app), scoped to that app's namespaces.
+            # Reset on a full refresh so a stale snapshot never bleeds through.
+            self._argo_extra = []
             # (name, namespace) -> Application, so an app-of-apps can expand the
             # child Applications it manages into their own resource subtrees.
             self._argo_app_index = {
@@ -3454,16 +3503,13 @@ class Dashboard(tk.Tk):
                     apps_err = None
                 except kubectl_collect.KubectlError as e:
                     apps_list, apps_err = [], e
-                # Deep mode: also pull every CRD instance + common built-in child
-                # kinds so custom-resource children render, not just rs→pods.
-                extra = (kubectl_collect.collect_owner_candidates(ctx())
-                         if deep_var.get() else [])
+                # Deep CRD children are fetched lazily per selected app (scoped to
+                # that app's namespaces), not here — see show_app.
                 return {
                     "apps": apps_list,
                     "apps_err": apps_err,
                     "rs": kubectl_collect.list_items_safe("rs", context=ctx()),
                     "pods": kubectl_collect.list_items_safe("pods", context=ctx()),
-                    "extra": extra,
                 }
             self._scoped_refresh(fetch, refill, status)
 

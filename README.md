@@ -355,9 +355,15 @@ the `Secret` it issues, or any operator CR that spawns more resources. Tick the
 instances plus the common built-in child kinds** (Services, Secrets, ConfigMaps,
 Endpoints, PVCs, Deployments/StatefulSets/DaemonSets, Jobs, Ingresses, HPAs) and
 walk `ownerReferences` across *all* of them — the same way Argo's own UI derives
-its tree. It's off by default because it issues one `kubectl get <kind> -A` per
-kind (heavier refresh); each kind is best-effort, so denied/absent kinds are
-simply skipped. Re-ticking re-pulls with the deeper snapshot.
+its tree.
+
+The deep pull is **scoped to the selected app** and fetched lazily: when Deep is
+on, selecting an Application pulls those kinds **only in the namespaces that app
+touches** (following app-of-apps into child Applications), off the UI thread —
+the light rs/pods tree draws immediately and deepens when the fetch returns. This
+is deliberately *not* a cluster-wide pull (that was far too slow); cluster-scoped
+CRDs are the only kinds fetched globally. Each kind is best-effort, so
+denied/absent kinds are simply skipped.
 
 If Argo CD isn't installed, the first call returns nothing and the tab says so —
 and it now distinguishes that from an **RBAC denial**: if you simply aren't
