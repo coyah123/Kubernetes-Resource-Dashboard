@@ -1152,6 +1152,13 @@ class Dashboard(tk.Tk):
         cmd_entry.pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(cmdbar, text="Copy", width=6,
                    command=self._copy_command).pack(side="left")
+        # Live "N kubectl commands running (Xs)" indicator — reads the in-flight
+        # counter kubectl_collect keeps across every worker thread, so you can see
+        # how much work a refresh (esp. the deep Argo walk) still has in flight.
+        self._busy_lbl = ttk.Label(cmdbar, text="", foreground="#d78")
+        self._busy_lbl.pack(side="left", padx=(6, 0))
+        self._busy_since = None
+        self.after(300, self._poll_busy)
         # kubectl runs on worker threads, so executed commands arrive via a queue
         # that the UI thread drains; selection previews call show_command directly.
         self._cmd_disp_q: queue.Queue = queue.Queue()
@@ -1274,6 +1281,22 @@ class Dashboard(tk.Tk):
         if last is not None:
             self._set_command(kubectl_collect.format_command(last), "(last run)")
         self.after(300, self._poll_cmd_display)
+
+    def _poll_busy(self):
+        """Reflect the live count of in-flight kubectl commands in the bottom bar."""
+        try:
+            n = kubectl_collect.inflight_count()
+            if n > 0:
+                if self._busy_since is None:
+                    self._busy_since = time.time()
+                secs = int(time.time() - self._busy_since)
+                plural = "s" if n != 1 else ""
+                self._busy_lbl.config(text=f"⏳ {n} kubectl command{plural} running · {secs}s")
+            else:
+                self._busy_since = None
+                self._busy_lbl.config(text="")
+        finally:
+            self.after(300, self._poll_busy)
 
     def _copy_command(self):
         """Copy the currently-shown command to the clipboard."""
@@ -2872,6 +2895,8 @@ class Dashboard(tk.Tk):
             ttk.Radiobutton(bar, text=label, value=label, variable=view_mode,
                             command=lambda: switch_view()).pack(side="left")
         status.pack(side="left", padx=8)
+        # Determinate progress for the deep CRD walk (packed on demand in show_app).
+        deep_prog = ttk.Progressbar(bar, mode="determinate", length=140)
 
         ttk.Label(frame, padding=(6, 0), text=(
             "Argo Applications and the resource tree each one deploys "
@@ -3281,31 +3306,39 @@ class Dashboard(tk.Tk):
             current_root["node"] = root
             (render_list if view_mode.get() == "List" else render_map)(root)
 
-        def app_namespaces(app, seen=None):
-            """Every namespace the app's managed resources live in, following
-            app-of-apps into child Applications — the scope for a deep fetch."""
+        def app_scope(app, seen=None):
+            """The (namespaces, api-groups) the app's managed resources span,
+            following app-of-apps into child Applications. Namespaces scope *where*
+            the deep fetch looks; groups scope *which* CRDs are worth fetching (an
+            operator's children live in its own API group), so we never query
+            unrelated operators' CRDs across the whole cluster."""
             seen = seen if seen is not None else set()
             meta = app.get("metadata", {})
             sig = (meta.get("name", ""), meta.get("namespace", ""))
             if sig in seen:
-                return set()
+                return set(), set()
             seen.add(sig)
             nss = {meta.get("namespace", "")}
+            groups: set[str] = set()
             for r in app.get("status", {}).get("resources", []) or []:
                 rns = r.get("namespace", "")
                 if rns:
                     nss.add(rns)
+                groups.add(r.get("group", "") or "")
                 if r.get("kind") == "Application":
                     child = getattr(self, "_argo_app_index", {}).get(
                         (r.get("name", ""), rns or meta.get("namespace", "")))
                     if child:
-                        nss |= app_namespaces(child, seen)
-            return {n for n in nss if n}
+                        cnss, cgroups = app_scope(child, seen)
+                        nss |= cnss
+                        groups |= cgroups
+            return {n for n in nss if n}, {g for g in groups if g}
 
         def show_app(_e=None):
             current_root["node"] = None
             canvas.delete("all")
             node_targets.clear()
+            deep_prog.pack_forget()
             iid = apps.focus()
             app = self._argo_apps.get(iid)
             if not app:
@@ -3315,21 +3348,38 @@ class Dashboard(tk.Tk):
                 render_app(app)
                 return
             # Deep mode: pull CRD/built-in children scoped to JUST this app's
-            # namespaces (off-thread), then redraw. Scoping keeps it fast — a
-            # cluster-wide pull of every CRD was far too slow.
-            nss = sorted(app_namespaces(app))
+            # namespaces AND only the CRDs in API groups the app actually manages
+            # (off-thread), then redraw. Both scopings keep it fast — a cluster-wide
+            # pull of every CRD was far too slow.
+            nss, groups = app_scope(app)
+            nss = sorted(nss)
             render_app(app)   # draw the light tree immediately; deepen when ready
+            deep_prog.config(value=0)
+            deep_prog.pack(side="left", padx=6)
+
+            def prog(d, t):
+                def upd():
+                    if apps.focus() != iid:
+                        return
+                    deep_prog.config(maximum=max(t, 1), value=d)
+                    status.config(text=f"⏳ deepening {d}/{t}")
+                    if d >= t:
+                        deep_prog.pack_forget()
+                self.after(0, upd)
 
             def fetch():
                 return kubectl_collect.collect_owner_candidates(
-                    ctx(), namespaces=nss)
+                    ctx(), namespaces=nss, groups=groups, progress=prog)
 
             def apply(extra):
+                deep_prog.pack_forget()
                 # Ignore if the user moved to another app while we were fetching.
                 if apps.focus() != iid:
                     return
                 self._argo_extra = extra
                 render_app(app)
+                status.config(text=f"deep: +{len(extra)} child object(s) "
+                                   f"from {len(nss)} ns / {len(groups)} group(s)")
 
             self._scoped_refresh(fetch, apply, status)
 

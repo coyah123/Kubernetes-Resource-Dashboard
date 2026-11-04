@@ -270,6 +270,12 @@ fetch that object (tagged *selected*); anything the app actually runs shows tagg
 *last run*. A **Copy** button puts it on your clipboard. Commands include
 `--context` and honor the `KUBECTL` override, so they're copy-paste runnable.
 
+Next to it, a live **⏳ N kubectl commands running · Xs** indicator counts the
+kubectl subprocesses in flight **across the whole app** at that moment (every tab
+and background walk shares one counter), with an elapsed timer — so a slow
+refresh or the deep Argo walk shows how much work is still queued rather than
+looking hung.
+
 > The embedded shells are line-oriented (no TTY): `ls`, `cat`, `env` work fine, but
 > full-screen programs (`vim`, `top`) and shell prompts won't render. Use `ls -C`
 > for columns. Bash is unavailable in minimal images (e.g. Alpine) — use **sh**.
@@ -357,13 +363,18 @@ Endpoints, PVCs, Deployments/StatefulSets/DaemonSets, Jobs, Ingresses, HPAs) and
 walk `ownerReferences` across *all* of them — the same way Argo's own UI derives
 its tree.
 
-The deep pull is **scoped to the selected app** and fetched lazily: when Deep is
-on, selecting an Application pulls those kinds **only in the namespaces that app
-touches** (following app-of-apps into child Applications), off the UI thread —
-the light rs/pods tree draws immediately and deepens when the fetch returns. This
-is deliberately *not* a cluster-wide pull (that was far too slow); cluster-scoped
-CRDs are the only kinds fetched globally. Each kind is best-effort, so
-denied/absent kinds are simply skipped.
+The deep pull is **scoped to the selected app** on two axes, and fetched lazily:
+when Deep is on, selecting an Application pulls children **only in the namespaces
+that app touches** and **only from the CRD API groups the app actually manages**
+(following app-of-apps into child Applications), off the UI thread — the light
+rs/pods tree draws immediately and deepens when the fetch returns. The group
+narrowing is the important one: an operator keeps its child CRs in its own API
+group (a `cert-manager.io/Certificate`'s children are all `cert-manager.io` /
+`acme.cert-manager.io`), so the walk fetches only *those* CRDs and never touches
+an unrelated operator's (Elastic, etc.). This is deliberately *not* a cluster-wide
+pull of every CRD (that was far too slow); cluster-scoped CRDs in a matched group
+are fetched once. Each kind is best-effort, so denied/absent kinds are skipped. A
+small **progress bar** next to the toggle tracks the deep walk (`deepening d/t`).
 
 If Argo CD isn't installed, the first call returns nothing and the tab says so —
 and it now distinguishes that from an **RBAC denial**: if you simply aren't

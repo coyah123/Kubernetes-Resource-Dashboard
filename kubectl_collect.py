@@ -20,9 +20,21 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 
 # Hide the flashing console window kubectl would otherwise pop on Windows.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+# Count of kubectl subprocesses running right now, across every worker thread, so
+# the GUI can show a live "N commands running" indicator. Guarded by a lock since
+# many background threads increment/decrement it.
+_inflight = 0
+_inflight_lock = threading.Lock()
+
+
+def inflight_count() -> int:
+    """How many kubectl commands are executing right now (all threads)."""
+    return _inflight
 
 
 class KubectlError(RuntimeError):
@@ -136,22 +148,29 @@ def _run(args: list[str], *, context: str = "", timeout: int = 60) -> str:
             "Install kubectl and make sure it's on PATH, or set the KUBECTL "
             "environment variable to the full command (e.g. 'sudo k3s kubectl')."
         )
+    global _inflight
+    with _inflight_lock:
+        _inflight += 1
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            creationflags=_NO_WINDOW,
-        )
-    except FileNotFoundError as e:
-        raise KubectlError(f"Could not execute {cmd[0]}: {e}") from e
-    except subprocess.TimeoutExpired as e:
-        raise KubectlError(f"kubectl timed out after {timeout}s: {' '.join(args)}") from e
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                creationflags=_NO_WINDOW,
+            )
+        except FileNotFoundError as e:
+            raise KubectlError(f"Could not execute {cmd[0]}: {e}") from e
+        except subprocess.TimeoutExpired as e:
+            raise KubectlError(f"kubectl timed out after {timeout}s: {' '.join(args)}") from e
 
-    if proc.returncode != 0:
-        raise KubectlError(
-            f"kubectl {' '.join(args)} failed (exit {proc.returncode}):\n"
-            + (proc.stderr.strip() or "(no error output)")
-        )
-    return proc.stdout
+        if proc.returncode != 0:
+            raise KubectlError(
+                f"kubectl {' '.join(args)} failed (exit {proc.returncode}):\n"
+                + (proc.stderr.strip() or "(no error output)")
+            )
+        return proc.stdout
+    finally:
+        with _inflight_lock:
+            _inflight -= 1
 
 
 def run_text(args: list[str], *, context: str = "", timeout: int = 60) -> str:
@@ -394,7 +413,24 @@ def list_crds(context: str = "") -> list[dict]:
     return sorted(out, key=lambda c: (c["group"], c["kind"]))
 
 
+def _group_related(crd_group: str, app_groups: set) -> bool:
+    """True if a CRD's API group is "related" to a group the app already manages —
+    i.e. the same group or a sub/parent domain of it (``acme.cert-manager.io`` is
+    related to ``cert-manager.io``). Operators keep their child CRs in the same
+    registrable domain, so this is how we fetch *only* the CRDs that could plausibly
+    be children of this app, instead of every CRD in the cluster."""
+    if not crd_group:
+        return False
+    for g in app_groups:
+        if not g:
+            continue
+        if crd_group == g or crd_group.endswith("." + g) or g.endswith("." + crd_group):
+            return True
+    return False
+
+
 def collect_owner_candidates(context: str = "", *, namespaces: list[str] | None = None,
+                             groups: set | None = None, progress=None,
                              timeout: int = 30) -> list[tuple]:
     """``(kind, ktype, obj)`` for every object that could be an ownerReferences
     child in the Argo resource tree — used for the opt-in "deep / CRD" expansion.
@@ -403,31 +439,22 @@ def collect_owner_candidates(context: str = "", *, namespaces: list[str] | None 
     rs/pods snapshot). That misses children of custom resources — e.g.
     cert-manager's Certificate → CertificateRequest → Order → Challenge, or any
     operator CR that spawns more resources. To grow those the way Argo's own UI
-    does, we pull instances of EVERY installed CRD plus the common built-in child
-    kinds, tag each with its known kind/ktype, and let ``children_index`` walk
-    ownerReferences across all of them.
+    does, we pull instances of the relevant CRDs plus the common built-in child
+    kinds and let ``children_index`` walk ownerReferences across all of them.
 
     ``namespaces`` scopes the pull: when given, namespaced kinds are fetched ONLY
-    in those namespaces (one ``kubectl get -n ns`` per kind per namespace) — far
-    cheaper than cluster-wide, and all the Argo tab needs since it expands one
-    selected app. Cluster-scoped CRDs are always fetched once (no namespace).
-    When ``namespaces`` is None, everything is pulled across all namespaces.
+    in those namespaces — far cheaper than cluster-wide. Cluster-scoped CRDs are
+    fetched once. ``groups`` narrows WHICH CRDs are fetched to those whose API
+    group is related to a group the app manages (see ``_group_related``), so an
+    unrelated operator's CRDs (Elastic, etc.) are never queried. When ``groups``
+    is None, every CRD is fetched (the old, slow behavior).
+
+    ``progress`` — optional callable ``(done, total)`` invoked after each
+    ``kubectl get`` so the GUI can drive a determinate progress bar.
 
     Best-effort: each kind is fetched independently and a denied/absent kind is
     skipped (returns []), so a limited user still gets whatever they can read."""
     out: list[tuple] = []
-
-    def grab(kind: str, ktype: str, cluster_scoped: bool = False):
-        if namespaces is None or cluster_scoped:
-            objs = list_items_safe(ktype, context=context, timeout=timeout)
-            out.extend((kind, ktype, o) for o in objs)
-            return
-        for ns in namespaces:
-            try:
-                objs = list_items(ktype, namespace=ns, context=context, timeout=timeout)
-            except KubectlError:
-                objs = []
-            out.extend((kind, ktype, o) for o in objs)
 
     # Built-in kinds that commonly appear as managed children but aren't in the
     # rs/pods snapshot. (ReplicaSets and Pods are collected separately already.)
@@ -443,11 +470,35 @@ def collect_owner_candidates(context: str = "", *, namespaces: list[str] | None 
         ("Ingress", "ingresses.networking.k8s.io"),
         ("HorizontalPodAutoscaler", "horizontalpodautoscalers.autoscaling"),
     ]
-    for kind, ktype in builtins:
-        grab(kind, ktype)
-    # Every installed CRD's instances, tagged with the CRD's own kind + fq name.
+    # (kind, ktype, cluster_scoped) for every kind we'll fetch.
+    tasks: list[tuple] = [(k, kt, False) for k, kt in builtins]
     for crd in list_crds(context=context):
-        grab(crd["kind"], crd["fq"], cluster_scoped=(crd.get("scope") == "Cluster"))
+        if groups is None or _group_related(crd.get("group", ""), groups):
+            tasks.append((crd["kind"], crd["fq"], crd.get("scope") == "Cluster"))
+
+    def gets_for(cluster_scoped: bool) -> list:
+        # None == one all-namespace get; otherwise one get per target namespace.
+        if namespaces is None or cluster_scoped:
+            return [None]
+        return list(namespaces)
+
+    total = sum(len(gets_for(cs)) for _, _, cs in tasks)
+    done = 0
+    if progress:
+        progress(0, total)
+    for kind, ktype, cs in tasks:
+        for ns in gets_for(cs):
+            if ns is None:
+                objs = list_items_safe(ktype, context=context, timeout=timeout)
+            else:
+                try:
+                    objs = list_items(ktype, namespace=ns, context=context, timeout=timeout)
+                except KubectlError:
+                    objs = []
+            out.extend((kind, ktype, o) for o in objs)
+            done += 1
+            if progress:
+                progress(done, total)
     return out
 
 
