@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Hide the flashing console window kubectl would otherwise pop on Windows.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -482,20 +483,30 @@ def collect_owner_candidates(context: str = "", *, namespaces: list[str] | None 
             return [None]
         return list(namespaces)
 
-    total = sum(len(gets_for(cs)) for _, _, cs in tasks)
+    # Flatten to individual (kind, ktype, namespace) gets, then run them in a
+    # thread pool. Parallelism both speeds the walk up and makes the app's
+    # "N commands running" indicator meaningful (sequential gets never show > 1).
+    units = [(kind, ktype, ns)
+             for kind, ktype, cs in tasks for ns in gets_for(cs)]
+    total = len(units)
     done = 0
     if progress:
         progress(0, total)
-    for kind, ktype, cs in tasks:
-        for ns in gets_for(cs):
-            if ns is None:
-                objs = list_items_safe(ktype, context=context, timeout=timeout)
-            else:
-                try:
-                    objs = list_items(ktype, namespace=ns, context=context, timeout=timeout)
-                except KubectlError:
-                    objs = []
-            out.extend((kind, ktype, o) for o in objs)
+
+    def fetch_unit(unit):
+        kind, ktype, ns = unit
+        if ns is None:
+            objs = list_items_safe(ktype, context=context, timeout=timeout)
+        else:
+            try:
+                objs = list_items(ktype, namespace=ns, context=context, timeout=timeout)
+            except KubectlError:
+                objs = []
+        return [(kind, ktype, o) for o in objs]
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for fut in as_completed(ex.submit(fetch_unit, u) for u in units):
+            out.extend(fut.result())
             done += 1
             if progress:
                 progress(done, total)

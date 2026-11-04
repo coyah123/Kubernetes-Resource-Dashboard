@@ -373,8 +373,11 @@ group (a `cert-manager.io/Certificate`'s children are all `cert-manager.io` /
 `acme.cert-manager.io`), so the walk fetches only *those* CRDs and never touches
 an unrelated operator's (Elastic, etc.). This is deliberately *not* a cluster-wide
 pull of every CRD (that was far too slow); cluster-scoped CRDs in a matched group
-are fetched once. Each kind is best-effort, so denied/absent kinds are skipped. A
-small **progress bar** next to the toggle tracks the deep walk (`deepening d/t`).
+are fetched once. Each kind is best-effort, so denied/absent kinds are skipped. The
+individual `kubectl get`s run **in parallel** (a small thread pool), so the walk
+finishes faster and the app-wide in-flight indicator actually climbs instead of
+sitting at 1. A small **progress bar** next to the toggle tracks the deep walk
+(`deepening d/t`) — that `d/t` is the true count of gets queued vs. done.
 
 If Argo CD isn't installed, the first call returns nothing and the tab says so —
 and it now distinguishes that from an **RBAC denial**: if you simply aren't
