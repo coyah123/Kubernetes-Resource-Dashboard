@@ -347,6 +347,18 @@ Applications until it bottoms out at real workloads/Pods, instead of stopping at
 the first child Application box. (A depth bound plus an ancestor check guard
 against any self-referential app-of-apps loop.)
 
+**Deep (expand CRD children).** By default the deep children are reconstructed
+only from the rs/pods snapshot, so **custom-resource** children don't expand —
+e.g. a cert-manager `Certificate → CertificateRequest → Order → Challenge` chain,
+the `Secret` it issues, or any operator CR that spawns more resources. Tick the
+**Deep (expand CRD children)** toggle to also pull **every installed CRD's
+instances plus the common built-in child kinds** (Services, Secrets, ConfigMaps,
+Endpoints, PVCs, Deployments/StatefulSets/DaemonSets, Jobs, Ingresses, HPAs) and
+walk `ownerReferences` across *all* of them — the same way Argo's own UI derives
+its tree. It's off by default because it issues one `kubectl get <kind> -A` per
+kind (heavier refresh); each kind is best-effort, so denied/absent kinds are
+simply skipped. Re-ticking re-pulls with the deeper snapshot.
+
 If Argo CD isn't installed, the first call returns nothing and the tab says so —
 and it now distinguishes that from an **RBAC denial**: if you simply aren't
 allowed to list Applications, the tab says *"🔒 You don't have access…"* rather

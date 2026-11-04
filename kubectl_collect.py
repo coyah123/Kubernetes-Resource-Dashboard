@@ -394,6 +394,48 @@ def list_crds(context: str = "") -> list[dict]:
     return sorted(out, key=lambda c: (c["group"], c["kind"]))
 
 
+def collect_owner_candidates(context: str = "", *, timeout: int = 30) -> list[tuple]:
+    """``(kind, ktype, obj)`` for every object that could be an ownerReferences
+    child in the Argo resource tree — used for the opt-in "deep / CRD" expansion.
+
+    The base Argo tree only reconstructs ReplicaSet → Pod children (from the
+    rs/pods snapshot). That misses children of custom resources — e.g.
+    cert-manager's Certificate → CertificateRequest → Order → Challenge, or any
+    operator CR that spawns more resources. To grow those the way Argo's own UI
+    does, we pull instances of EVERY installed CRD plus the common built-in child
+    kinds, tag each with its known kind/ktype, and let ``children_index`` walk
+    ownerReferences across all of them.
+
+    Best-effort: each kind is fetched independently and a denied/absent kind is
+    skipped (returns []), so a limited user still gets whatever they can read.
+    This is heavier than the default refresh (one ``kubectl get`` per kind), which
+    is why the GUI puts it behind a toggle."""
+    out: list[tuple] = []
+    # Built-in kinds that commonly appear as managed children but aren't in the
+    # rs/pods snapshot. (ReplicaSets and Pods are collected separately already.)
+    builtins = [
+        ("Service", "services"), ("Endpoints", "endpoints"),
+        ("Secret", "secrets"), ("ConfigMap", "configmaps"),
+        ("ServiceAccount", "serviceaccounts"),
+        ("PersistentVolumeClaim", "persistentvolumeclaims"),
+        ("Deployment", "deployments.apps"),
+        ("StatefulSet", "statefulsets.apps"), ("DaemonSet", "daemonsets.apps"),
+        ("ControllerRevision", "controllerrevisions.apps"),
+        ("Job", "jobs.batch"), ("CronJob", "cronjobs.batch"),
+        ("Ingress", "ingresses.networking.k8s.io"),
+        ("HorizontalPodAutoscaler", "horizontalpodautoscalers.autoscaling"),
+    ]
+    for kind, ktype in builtins:
+        for obj in list_items_safe(ktype, context=context, timeout=timeout):
+            out.append((kind, ktype, obj))
+    # Every installed CRD's instances, tagged with the CRD's own kind + fq name.
+    for crd in list_crds(context=context):
+        kind, fq = crd["kind"], crd["fq"]
+        for obj in list_items_safe(fq, context=context, timeout=timeout):
+            out.append((kind, fq, obj))
+    return out
+
+
 def _crd_printer_columns(spec: dict) -> list[dict]:
     """
     additionalPrinterColumns from a CRD spec, preferring the storage version.

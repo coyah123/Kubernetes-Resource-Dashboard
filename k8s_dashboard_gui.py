@@ -2856,6 +2856,13 @@ class Dashboard(tk.Tk):
         ttk.Button(bar, text="⟳ Refresh selected app",
                    command=lambda: refresh_selected_app()).pack(side="left", padx=4)
 
+        # Opt-in deep expansion: also pull every CRD instance + common built-in
+        # child kinds so custom-resource children (cert-manager chains, operator
+        # CRs, …) render — not just ReplicaSet→Pod. Heavier, hence off by default.
+        deep_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Deep (expand CRD children)", variable=deep_var,
+                        command=lambda: do_refresh()).pack(side="left", padx=(12, 0))
+
         ttk.Label(bar, text="View:").pack(side="left", padx=(12, 2))
         view_mode = tk.StringVar(value="Map")
         for label in ("Map", "List"):
@@ -3123,12 +3130,14 @@ class Dashboard(tk.Tk):
 
         def children_index():
             """Map (ownerKindLower, ownerName, ns) -> [(kind, ktype, obj)] from
-            the ReplicaSet + Pod snapshot, so any node can look up what it owns."""
+            the ReplicaSet + Pod snapshot (plus the deep CRD/built-in snapshot
+            when "Deep" is on), so any node can look up what it owns."""
             idx = {}
             sources = ([("ReplicaSet", "replicaset.apps", o)
                         for o in getattr(self, "_argo_rs", [])]
                        + [("Pod", "pod", o)
-                          for o in getattr(self, "_argo_pods", [])])
+                          for o in getattr(self, "_argo_pods", [])]
+                       + list(getattr(self, "_argo_extra", [])))
             for kind, ktype, obj in sources:
                 meta = obj.get("metadata", {})
                 ns = meta.get("namespace", "")
@@ -3144,7 +3153,7 @@ class Dashboard(tk.Tk):
             seen = seen or frozenset()
             # Depth bound + an ancestor set guard against owner cycles and any
             # app-of-apps loop (an Application that transitively references itself).
-            if depth < 8 and sig not in seen:
+            if depth < 12 and sig not in seen:
                 seen = seen | {sig}
                 # Workload children reconstructed from ownerReferences (rs → pods).
                 for ckind, cktype, cobj in idx.get((kind.lower(), name, ns), []):
@@ -3349,6 +3358,9 @@ class Dashboard(tk.Tk):
             list_targets.clear()
             self._argo_rs = data.get("rs", [])
             self._argo_pods = data.get("pods", [])
+            # (kind, ktype, obj) for the opt-in deep CRD/built-in walk; empty
+            # unless "Deep" is ticked. Folded into children_index alongside rs/pods.
+            self._argo_extra = data.get("extra", [])
             # (name, namespace) -> Application, so an app-of-apps can expand the
             # child Applications it manages into their own resource subtrees.
             self._argo_app_index = {
@@ -3442,11 +3454,16 @@ class Dashboard(tk.Tk):
                     apps_err = None
                 except kubectl_collect.KubectlError as e:
                     apps_list, apps_err = [], e
+                # Deep mode: also pull every CRD instance + common built-in child
+                # kinds so custom-resource children render, not just rs→pods.
+                extra = (kubectl_collect.collect_owner_candidates(ctx())
+                         if deep_var.get() else [])
                 return {
                     "apps": apps_list,
                     "apps_err": apps_err,
                     "rs": kubectl_collect.list_items_safe("rs", context=ctx()),
                     "pods": kubectl_collect.list_items_safe("pods", context=ctx()),
+                    "extra": extra,
                 }
             self._scoped_refresh(fetch, refill, status)
 
