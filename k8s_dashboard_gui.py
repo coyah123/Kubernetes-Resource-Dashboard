@@ -773,6 +773,43 @@ def add_export_buttons(toolbar, tree, *, status_cb=None, side="right"):
     return menu
 
 
+def export_unique_lines(lines, *, label="images", status_cb=None):
+    """Write ``lines`` (any iterable of strings) to a plain .txt file, one per
+    line, de-duplicated and sorted case-insensitively.
+
+    Unlike the CSV/XLSX export (one row per container) this collapses the view
+    down to a unique set — e.g. the distinct images or image@digest pairs shown.
+    """
+    seen = set()
+    out = []
+    for val in lines:
+        val = (val or "").strip()
+        if val and val != "—" and val not in seen:
+            seen.add(val)
+            out.append(val)
+    if not out:
+        messagebox.showinfo("Export", f"No {label} to export.")
+        return
+    out.sort(key=str.lower)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = filedialog.asksaveasfilename(
+        title=f"Export unique {label} to text",
+        defaultextension=".txt",
+        initialfile=f"k8s-{label.replace(' ', '-')}-{stamp}.txt",
+        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+    )
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as e:
+        messagebox.showerror("Export failed", str(e))
+        return
+    if status_cb:
+        status_cb(f"✓ exported {len(out)} unique {label} → {path}")
+
+
 # ---------------------------------------------------------------------------
 # WrapBar — a horizontal toolbar whose children reflow onto extra rows when the
 # window is too narrow to fit them all on one line.
@@ -2735,6 +2772,40 @@ class Dashboard(tk.Tk):
             self._scoped_refresh(fetch, apply, refresh_status)
 
         ttk.Button(bar, text="⟳ Refresh images", command=do_refresh).pack(side="left", padx=6)
+
+        # Unique-image text export: the rows shown collapsed to a distinct set,
+        # one per line. The format dropdown picks tag only, pinned digest only,
+        # or the fully-qualified image@digest — all from the full (untruncated)
+        # values captured in `view_imgs` during refill, not the shortened column.
+        view_imgs = []  # [(image, digest)] for the rows currently in view
+
+        def _pin(image, digest):
+            """image@sha256:… using the resolved digest; bare tag if none known."""
+            if not digest or digest == "—":
+                return image
+            sha = digest.split("@", 1)[1] if "@" in digest else digest
+            return f"{image}@{sha}"
+
+        def do_txt_export():
+            fmt = img_fmt.get()
+            if fmt == "digest":
+                lines = (d for _, d in view_imgs)
+                label = "image digests"
+            elif fmt == "image@digest":
+                lines = (_pin(i, d) for i, d in view_imgs)
+                label = "image+digest"
+            else:
+                lines = (i for i, _ in view_imgs)
+                label = "images"
+            export_unique_lines(lines, label=label,
+                                status_cb=lambda m: self.status.config(text=m))
+
+        ttk.Label(bar, text="txt:").pack(side="left", padx=(10, 0))
+        img_fmt = tk.StringVar(value="image")
+        ttk.Combobox(bar, textvariable=img_fmt, width=13, state="readonly",
+                     values=["image", "digest", "image@digest"]).pack(side="left", padx=2)
+        ttk.Button(bar, text="⬇ Unique (txt)",
+                   command=do_txt_export).pack(side="left", padx=2)
         count_lbl = ttk.Label(bar, text="")
         count_lbl.pack(side="left", padx=8)
         refresh_status.pack(side="left", padx=4)
@@ -2766,6 +2837,7 @@ class Dashboard(tk.Tk):
         def refill(*_):
             for r in tree.get_children(""):
                 tree.delete(r)
+            view_imgs.clear()
             q = filt.get().lower()
             ns = ns_var.get()
             typ = type_var.get()
@@ -2786,6 +2858,7 @@ class Dashboard(tk.Tk):
                     tree.insert("", "end", tags=(tag,), values=(
                         "⧉", p["namespace"], p["owner"], p["pod"], img["container"],
                         img["type"], img["image"], short_digest(img["digest"]), img["pull"]))
+                    view_imgs.append((img["image"], img.get("digest", "")))
                     n_rows += 1
                     uniq.add(img["image"])
                     pods_seen.add((p["namespace"], p["pod"]))
