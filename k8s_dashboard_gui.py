@@ -773,12 +773,16 @@ def add_export_buttons(toolbar, tree, *, status_cb=None, side="right"):
     return menu
 
 
-def export_unique_lines(lines, *, label="images", status_cb=None):
-    """Write ``lines`` (any iterable of strings) to a plain .txt file, one per
-    line, de-duplicated and sorted case-insensitively.
+def export_unique_lines(lines, *, label="images", status_cb=None, allow_csv=False):
+    """Write ``lines`` (any iterable of strings) to a plain .txt (or .csv) file,
+    one value per line, de-duplicated and sorted case-insensitively.
 
     Unlike the CSV/XLSX export (one row per container) this collapses the view
     down to a unique set — e.g. the distinct images or image@digest pairs shown.
+
+    With ``allow_csv=True`` the save dialog also offers .csv; the chosen file
+    extension picks the format. Either way it's one value per line (a .csv opens
+    as a single column in Excel), so the de-duplicated list stays simple.
     """
     seen = set()
     out = []
@@ -792,17 +796,28 @@ def export_unique_lines(lines, *, label="images", status_cb=None):
         return
     out.sort(key=str.lower)
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    filetypes = [("Text files", "*.txt")]
+    if allow_csv:
+        filetypes.append(("CSV files", "*.csv"))
+    filetypes.append(("All files", "*.*"))
     path = filedialog.asksaveasfilename(
-        title=f"Export unique {label} to text",
+        title=f"Export unique {label}",
         defaultextension=".txt",
         initialfile=f"k8s-{label.replace(' ', '-')}-{stamp}.txt",
-        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        filetypes=filetypes,
     )
     if not path:
         return
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(out) + "\n")
+        if path.lower().endswith(".csv"):
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow([label])
+                for val in out:
+                    w.writerow([val])
+        else:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(out) + "\n")
     except OSError as e:
         messagebox.showerror("Export failed", str(e))
         return
@@ -2800,12 +2815,33 @@ class Dashboard(tk.Tk):
             export_unique_lines(lines, label=label,
                                 status_cb=lambda m: self.status.config(text=m))
 
-        ttk.Label(bar, text="txt:").pack(side="left", padx=(10, 0))
+        def _fmt_lines(pairs, fmt):
+            """Map [(image, digest)] to the chosen one-value-per-line format."""
+            if fmt == "digest":
+                return [d for _, d in pairs], "image digests"
+            if fmt == "image@digest":
+                return [_pin(i, d) for i, d in pairs], "image+digest"
+            return [i for i, _ in pairs], "images"
+
+        def do_all_export():
+            """Every container image across the WHOLE cluster — ignores the
+            Namespace/Type/text filters — de-duplicated, to .txt or .csv."""
+            all_pairs = []
+            for p in self.model["pods"]:
+                for img in p.get("images", []):
+                    all_pairs.append((img["image"], img.get("digest", "")))
+            lines, label = _fmt_lines(all_pairs, img_fmt.get())
+            export_unique_lines(lines, label=label, allow_csv=True,
+                                status_cb=lambda m: self.status.config(text=m))
+
+        ttk.Label(bar, text="unique:").pack(side="left", padx=(10, 0))
         img_fmt = tk.StringVar(value="image")
         ttk.Combobox(bar, textvariable=img_fmt, width=13, state="readonly",
                      values=["image", "digest", "image@digest"]).pack(side="left", padx=2)
-        ttk.Button(bar, text="⬇ Unique (txt)",
+        ttk.Button(bar, text="⬇ In view (txt)",
                    command=do_txt_export).pack(side="left", padx=2)
+        ttk.Button(bar, text="⬇ All cluster (txt/csv)",
+                   command=do_all_export).pack(side="left", padx=2)
         count_lbl = ttk.Label(bar, text="")
         count_lbl.pack(side="left", padx=8)
         refresh_status.pack(side="left", padx=4)
