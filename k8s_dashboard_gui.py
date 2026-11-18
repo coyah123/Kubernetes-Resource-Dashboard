@@ -855,25 +855,59 @@ class WrapBar(ttk.Frame):
 
     def __init__(self, master, *, padx=2, pady=2, **kw):
         super().__init__(master, **kw)
-        self._items = []                 # [(widget, (padx_lo, padx_hi), (pady_lo, pady_hi))]
+        self._items = []                 # [(widget, (px_lo, px_hi), (py_lo, py_hi), grow)]
         self._default_padx = padx
         self._default_pady = pady
         self._reflow_pending = False
         self.bind("<Configure>", lambda e: self._schedule_reflow())
 
-    def add(self, widget, *, padx=None, pady=None):
+    def add(self, widget, *, padx=None, pady=None, grow=False):
         """Register `widget` (already built with this bar as master) in the flow."""
-        return self.insert(len(self._items), widget, padx=padx, pady=pady)
+        return self.insert(len(self._items), widget, padx=padx, pady=pady, grow=grow)
 
-    def insert(self, index, widget, *, padx=None, pady=None):
+    def insert(self, index, widget, *, padx=None, pady=None, grow=False):
         """Insert `widget` at position `index` in the flow (0 = front)."""
         self._items.insert(index, (
             widget,
             _pad_pair(self._default_padx if padx is None else padx),
             _pad_pair(self._default_pady if pady is None else pady),
+            grow,
         ))
         self._schedule_reflow()
         return widget
+
+    def _adopt_pack_slaves(self):
+        """Pull in any children still managed by pack() so callers can keep the
+        familiar ``child.pack(side="left", padx=…)`` idiom — we convert each into
+        a flow item, preserving order, padding, and fill="x"+expand (which becomes
+        a stretch to the rest of its row). This makes WrapBar a drop-in for a plain
+        ttk.Frame toolbar: swap the class and the buttons start wrapping, no other
+        edits needed. (side= is dropped — everything flows left-to-right.)"""
+        known = {w for w, _, _, _ in self._items}
+        for child in self.pack_slaves():
+            if child in known:
+                continue
+            try:
+                info = child.pack_info()
+            except tk.TclError:
+                continue
+            px = _pad_pair(self._coerce_pad(info.get("padx", self._default_padx)))
+            py = _pad_pair(self._coerce_pad(info.get("pady", self._default_pady)))
+            grow = (str(info.get("expand", "0")) in ("1", "True", "true")
+                    and "x" in str(info.get("fill", "")))
+            child.pack_forget()
+            self._items.append((child, px, py, grow))
+            known.add(child)
+
+    @staticmethod
+    def _coerce_pad(p):
+        """pack_info() pads come back as int, '4', or '4 0' — normalize to int/pair."""
+        if isinstance(p, str):
+            parts = p.split()
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+            return int(parts[0]) if parts and parts[0] else 0
+        return p
 
     def _schedule_reflow(self):
         # Coalesce the storm of <Configure> events a resize produces into one pass.
@@ -885,18 +919,24 @@ class WrapBar(ttk.Frame):
         self._reflow_pending = False
         if not self.winfo_exists():
             return
+        self._adopt_pack_slaves()
         avail = self.winfo_width()
         if avail <= 1:                   # not mapped/sized yet — wait for a real width
             return
         x = y = row_h = 0
-        for widget, (px_lo, px_hi), (py_lo, py_hi) in self._items:
+        for widget, (px_lo, px_hi), (py_lo, py_hi), grow in self._items:
             w = widget.winfo_reqwidth() + px_lo + px_hi
             h = widget.winfo_reqheight() + py_lo + py_hi
             if x + w > avail and x > 0:   # doesn't fit — wrap (but never on a row's 1st item)
                 x = 0
                 y += row_h
                 row_h = 0
-            widget.place(x=x + px_lo, y=y + py_lo)
+            if grow:                      # fill="x"+expand child — take the rest of the row
+                stretch = max(widget.winfo_reqwidth(), avail - x - px_lo - px_hi)
+                widget.place(x=x + px_lo, y=y + py_lo, width=stretch)
+                w = stretch + px_lo + px_hi
+            else:
+                widget.place(x=x + px_lo, y=y + py_lo)
             x += w
             row_h = max(row_h, h)
         total = y + row_h
@@ -1169,7 +1209,7 @@ class Dashboard(tk.Tk):
         ttk.Button(off, text="Load files", command=self.reload).pack(side="left", padx=4)
 
         # --- Row 3: status ----------------------------------------------------
-        bar = ttk.Frame(self, padding=(6, 2, 6, 4))
+        bar = WrapBar(self, padding=(6, 2, 6, 4))
         bar.pack(fill="x")
         self.status = ttk.Label(bar, text="")
         self.status.pack(side="left")
@@ -1193,7 +1233,7 @@ class Dashboard(tk.Tk):
         # Packed side=bottom BEFORE the body so it stays pinned to the window's
         # bottom edge. It shows the kubectl command the app just ran OR the command
         # you'd type to fetch whatever row you've highlighted — a live cheat sheet.
-        cmdbar = ttk.Frame(self, padding=(6, 2, 6, 4))
+        cmdbar = WrapBar(self, padding=(6, 2, 6, 4))
         cmdbar.pack(side="bottom", fill="x")
         ttk.Label(cmdbar, text="kubectl:").pack(side="left")
         self._cmd_source = ttk.Label(cmdbar, text="", width=16, foreground="#777")
@@ -1561,7 +1601,7 @@ class Dashboard(tk.Tk):
         win.title("My access (kubectl auth can-i --list)")
         win.geometry("760x520")
 
-        bar = ttk.Frame(win, padding=6)
+        bar = WrapBar(win, padding=6)
         bar.pack(fill="x")
         ttk.Label(bar, text="Namespace:").pack(side="left")
         ns_var = tk.StringVar(value="")
@@ -2053,7 +2093,7 @@ class Dashboard(tk.Tk):
         self._analysis_frames.append(frame)
 
         # Overview summarizes every kind, so its refresh is the full cluster pull.
-        topbar = ttk.Frame(frame, padding=4)
+        topbar = WrapBar(frame, padding=4)
         topbar.pack(fill="x")
         ttk.Button(topbar, text="⟳ Refresh from cluster",
                    command=self.refresh_from_cluster).pack(side="left")
@@ -2151,7 +2191,7 @@ class Dashboard(tk.Tk):
         list_frame.pack(fill="both", expand=True)
 
         ctx = lambda: self.context_var.get().strip()
-        bar = ttk.Frame(list_frame, padding=4)
+        bar = WrapBar(list_frame, padding=4)
         bar.pack(fill="x")
         status = ttk.Label(bar, text="")
 
@@ -2369,7 +2409,7 @@ class Dashboard(tk.Tk):
         list_frame = ttk.Frame(frame)
         list_frame.pack(fill="both", expand=True)
 
-        bar = ttk.Frame(list_frame, padding=4)
+        bar = WrapBar(list_frame, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="Namespace:").pack(side="left")
         namespaces = ["(all)"] + sorted({d["namespace"] for d in self.model["deployments"]})
@@ -2493,7 +2533,7 @@ class Dashboard(tk.Tk):
         self._analysis_frames.append(frame)
         list_frame = ttk.Frame(frame)
         list_frame.pack(fill="both", expand=True)
-        bar = ttk.Frame(list_frame, padding=4)
+        bar = WrapBar(list_frame, padding=4)
         bar.pack(fill="x")
         ctx = lambda: self.context_var.get().strip()
 
@@ -2742,7 +2782,7 @@ class Dashboard(tk.Tk):
         list_frame.pack(fill="both", expand=True)
         ctx = lambda: self.context_var.get().strip()
 
-        bar = ttk.Frame(list_frame, padding=4)
+        bar = WrapBar(list_frame, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="Namespace:").pack(side="left")
         namespaces = ["(all)"] + sorted({p["namespace"] for p in self.model["pods"]})
@@ -2980,7 +3020,7 @@ class Dashboard(tk.Tk):
         self._analysis_frames.append(frame)
         ctx = lambda: self.context_var.get().strip()
 
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         status = ttk.Label(bar, text="")
         ttk.Button(bar, text="⟳ Refresh applications",
@@ -3165,7 +3205,7 @@ class Dashboard(tk.Tk):
 
         # --- List view: the same tree with ☑ checkboxes + bulk restart/delete.
         list_wrap = ttk.Frame(right)
-        lbar = ttk.Frame(list_wrap, padding=(4, 2))
+        lbar = WrapBar(list_wrap, padding=(4, 2))
         lbar.pack(side="bottom", fill="x")
         ttk.Button(lbar, text="Rollout restart",
                    command=lambda: list_restart()).pack(side="left")
@@ -3685,7 +3725,7 @@ class Dashboard(tk.Tk):
         self._analysis_frames.append(frame)
         ctx = lambda: self.context_var.get().strip()
 
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         status = ttk.Label(bar, text="")
 
@@ -4826,7 +4866,7 @@ class ResourceDetailView(ttk.Frame):
         win.geometry("820x640")
         win.transient(self.winfo_toplevel())
 
-        bar = ttk.Frame(win, padding=4)
+        bar = WrapBar(win, padding=4)
         bar.pack(fill="x")
         status = ttk.Label(bar, text="Edit the YAML, then Apply. Apply runs "
                                      "`kubectl apply -f -`.")
@@ -4922,7 +4962,7 @@ class ResourceDetailView(ttk.Frame):
     def _build_cmd_tab(self, nb, title, args):
         frame = ttk.Frame(nb)
         nb.add(frame, text=title)
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         status = ttk.Label(bar, text="")
         ttk.Button(bar, text="⟳ Refresh",
@@ -4993,7 +5033,7 @@ class ResourceDetailView(ttk.Frame):
         self._search_idx = -1
         self._search_last = None      # last widget we tagged, to clear later
 
-        bar = ttk.Frame(self, padding=(4, 2))
+        bar = WrapBar(self, padding=(4, 2))
         bar.pack(side="bottom", fill="x")
         ttk.Label(bar, text="🔎 Find:").pack(side="left")
         self._search_var = tk.StringVar()
@@ -5096,7 +5136,7 @@ class ResourceDetailView(ttk.Frame):
         frame = ttk.Frame(nb)
         nb.add(frame, text="Get secret")
 
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="Decoder:").pack(side="left")
         self._sec_decoder = tk.StringVar(value="Base64")
@@ -5208,7 +5248,7 @@ class ResourceDetailView(ttk.Frame):
         win.title(f"TLS cert — {self.name}/{key}")
         win.geometry("820x620")
 
-        bar = ttk.Frame(win, padding=4)
+        bar = WrapBar(win, padding=4)
         bar.pack(fill="x")
         ttk.Label(bar, text="View:").pack(side="left")
         view_var = tk.StringVar(value="Chain summary")
@@ -5298,7 +5338,7 @@ class ResourceDetailView(ttk.Frame):
         and auto-scroll. A reader thread feeds _log_q; _pump_logs drains it."""
         frame = ttk.Frame(nb)
         nb.add(frame, text="Logs (live)")
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         self._log_status = ttk.Label(bar, text="")
         self._pause_btn = ttk.Button(bar, text="⏸ Pause", command=self._toggle_pause)
@@ -5394,7 +5434,7 @@ class ResourceDetailView(ttk.Frame):
         frame = ttk.Frame(nb)
         label = "Pods on node" if self.kind in ("nodes", "node") else "Pods"
         nb.add(frame, text=label)
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         self._rpods_status = ttk.Label(bar, text="")
         ttk.Button(bar, text="⟳ Refresh",
@@ -5522,7 +5562,7 @@ class ResourceDetailView(ttk.Frame):
         frame = ttk.Frame(nb)
         nb.add(frame, text=f"Shell: {shell}")
 
-        bar = ttk.Frame(frame, padding=4)
+        bar = WrapBar(frame, padding=4)
         bar.pack(fill="x")
         status = ttk.Label(bar, text="")
         # Per-tab mutable state so sh and bash don't collide.
@@ -5543,7 +5583,7 @@ class ResourceDetailView(ttk.Frame):
         vs.pack(side="right", fill="y")
         st["out"] = out
 
-        inbar = ttk.Frame(frame, padding=4)
+        inbar = WrapBar(frame, padding=4)
         inbar.pack(fill="x")
         ttk.Label(inbar, text="$").pack(side="left")
         entry = ttk.Entry(inbar)
