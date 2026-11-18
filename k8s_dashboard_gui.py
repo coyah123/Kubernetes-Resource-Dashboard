@@ -1181,7 +1181,7 @@ class Dashboard(tk.Tk):
         self._dbg_targets_q: queue.Queue = queue.Queue()
 
         # --- Row 1: live cluster (kubectl on your PATH) -----------------------
-        live = ttk.Frame(self, padding=(6, 6, 6, 2))
+        live = WrapBar(self, padding=(6, 6, 6, 2))
         live.pack(fill="x")
         ttk.Label(live, text="Cluster context:").pack(side="left")
         self.context_var = tk.StringVar()
@@ -1200,7 +1200,7 @@ class Dashboard(tk.Tk):
                         variable=self.cache_var).pack(side="left", padx=8)
 
         # --- Row 2: offline (previously-collected JSON files) -----------------
-        off = ttk.Frame(self, padding=(6, 2, 6, 2))
+        off = WrapBar(self, padding=(6, 2, 6, 2))
         off.pack(fill="x")
         ttk.Label(off, text="Data folder:").pack(side="left")
         self.path_var = tk.StringVar(value=str(folder))
@@ -1746,7 +1746,7 @@ class Dashboard(tk.Tk):
         # (the command-preview wiring is added by callers via _wire_cmd_preview)
 
         # Toolbar above every table with a visible export button.
-        tools = ttk.Frame(wrap)
+        tools = WrapBar(wrap)
         tools.pack(side="top", fill="x", pady=(0, 2))
 
         body = ttk.Frame(wrap)
@@ -2360,7 +2360,7 @@ class Dashboard(tk.Tk):
         set_view("Health")   # start on the compact health view, not all columns at once
 
         # -- cordon / uncordon on the checked (or focused) nodes --
-        act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
+        act = WrapBar(list_frame, padding=(4, 0, 4, 4))
         act.pack(fill="x")
         act_status = ttk.Label(act, text="")
 
@@ -2484,7 +2484,7 @@ class Dashboard(tk.Tk):
         refill()
 
         # -- bulk actions --
-        act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
+        act = WrapBar(list_frame, padding=(4, 0, 4, 4))
         act.pack(fill="x")
         act_status = ttk.Label(act, text="")
 
@@ -2724,7 +2724,7 @@ class Dashboard(tk.Tk):
 
         frame.bind("<Map>", ensure_nodes, add="+")
 
-        act = ttk.Frame(list_frame, padding=(4, 0, 4, 4))
+        act = WrapBar(list_frame, padding=(4, 0, 4, 4))
         act.pack(fill="x")
         act_status = ttk.Label(act, text="")
 
@@ -3806,7 +3806,7 @@ class Dashboard(tk.Tk):
             "One line per deployment in the selected namespace.")).pack(anchor="w")
 
         # controls
-        ctl = ttk.Frame(frame, padding=6)
+        ctl = WrapBar(frame, padding=6)
         ctl.pack(fill="x")
         ttk.Label(ctl, text="Interval:").pack(side="left")
         self.trends_interval = tk.StringVar(value="15 min")
